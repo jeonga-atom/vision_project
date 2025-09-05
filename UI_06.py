@@ -9,6 +9,7 @@ import zmq
 import base64
 import numpy as np
 import cv2
+from std_msgs.msg import Empty
 
 # ---------------------------
 # Configuration & Constants
@@ -997,8 +998,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """보급상자"""
         if not self.state.get_flag('safebox2_flag'):
             self.state.set_flag('safebox2_flag', True)
-            self.btn_m4_safebox.setText("SAFEBOX_2: YES")
-            self.btn_m4_safebox.setStyleSheet(UI_STYLES.DET_ACTIVE)
+            self.btn_m4_safebox2.setText("SAFEBOX_2: YES")
+            self.btn_m4_safebox2.setStyleSheet(UI_STYLES.DET_ACTIVE)
             self._append_log("[ROS2] Safebox_2 detected!")
     
     @QtCore.Slot()
@@ -1152,10 +1153,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ros_thread.human_tick.connect(self._on_human_tick_m4)
             self.ros_thread.finish_detected.connect(self._on_finish_detected)
             
-            # # 로봇 상태 시그널 연결
-            # self.ros_thread.robot_ok.connect(self._on_robot_ok)
-            # self.ros_thread.robot_open.connect(self._on_robot_open)
-            # self.ros_thread.robot_pick.connect(self._on_robot_pick)
+            # 로봇 상태 시그널 연결
+            self.ros_thread.robot_ok.connect(self._on_robot_ok)
+            self.ros_thread.robot_open.connect(self._on_robot_open)
+            self.ros_thread.robot_pick.connect(self._on_robot_pick)
 
             # --- mission3 전용 END 시그널 ---
             self.ros_thread.robot_button_end.connect(self._on_robot_button_end)
