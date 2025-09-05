@@ -180,18 +180,21 @@ class ZmqSubscriberThread(BaseSubscriberThread):
 # ---------------------------
 class Ros2SubscriberThread(BaseSubscriberThread):
     # 탐지 시그널들
-    sos_detected = QtCore.Signal()
-    button_detected = QtCore.Signal()
-    fire_detected = QtCore.Signal()
-    door_detected = QtCore.Signal()
+    sos_detected     = QtCore.Signal()
+    button_detected  = QtCore.Signal()
+    fire_detected    = QtCore.Signal()
+    door_detected    = QtCore.Signal()
     safebox_detected = QtCore.Signal()
-    human_detected = QtCore.Signal()
-    finish_detected = QtCore.Signal()
+    human_detected   = QtCore.Signal()
+    finish_detected  = QtCore.Signal()
     
     # 로봇 상태 시그널들
-    robot_ok = QtCore.Signal()
-    robot_open = QtCore.Signal()
-    robot_pick = QtCore.Signal()
+    robot_ok            = QtCore.Signal()
+    robot_open          = QtCore.Signal()
+    robot_pick          = QtCore.Signal()
+    robot_button_end    = QtCore.Signal()
+    robot_open_door_end = QtCore.Signal()
+
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -202,10 +205,14 @@ class Ros2SubscriberThread(BaseSubscriberThread):
         """구독 생성 (중복 코드 제거)"""
         # 탐지 토픽들
         detection_topics = {
+            # mission 1
             '/object_detection/SOS': self.sos_detected,
+            # mission 3
             '/object_detection/button': self.button_detected,
-            '/object_detection/fire': self.fire_detected,
+            '/object_detection/fire/on': self.fire_detected,
+            '/object_detection/fire/off': self.fire_detected,
             '/object_detection/door': self.door_detected,
+            #mission 4
             '/object_detection/safebox': self.safebox_detected,
             '/object_detection/human': self.human_detected,
             '/object_detection/finish': self.finish_detected,
@@ -217,9 +224,15 @@ class Ros2SubscriberThread(BaseSubscriberThread):
             '/robot/open': self.robot_open,
             '/robot/pick': self.robot_pick,
         }
-        
+
+        # ---------- mission3 로봇암 완료 토픽 ----------
+        robot_arm_topics = {
+            '/robot_arm/button_end'   : self.robot_button_end,
+            '/robot_arm/open_door_end': self.robot_open_door_end,
+        }
+
         # 모든 토픽 구독
-        all_topics = {**detection_topics, **robot_topics}
+        all_topics = {**detection_topics, **robot_topics, **robot_arm_topics}
         
         for topic, signal in all_topics.items():
             try:
@@ -233,6 +246,36 @@ class Ros2SubscriberThread(BaseSubscriberThread):
                 self.emit_log(f"[ROS2] Subscribed to {topic}")
             except Exception as e:
                 self.emit_log(f"[ROS2] Subscription error {topic}: {e}")
+
+        #구독 생성 (공통 함수)
+    # def sub_empty(topic, signal):
+    #     sub = self._node.create_subscription(
+    #         Empty, topic, lambda _msg, sig=signal: sig.emit(), 10
+    #     )
+    #     self._subs.append(sub)
+    #     self.emit_log(f"[ROS2] Subscribed to {topic}")
+
+    # for t, sig in detection_topics.items():
+    #     try: sub_empty(t, sig)
+    #     except Exception as e: self.emit_log(f"[ROS2] Subscription error {t}: {e}")
+
+    # for t, sig in robot_topics.items():
+    #     try: sub_empty(t, sig)
+    #     except Exception as e: self.emit_log(f"[ROS2] Subscription error {t}: {e}")
+
+    # for t, sig in robot_arm_topics.items():
+    #     try: sub_empty(t, sig)
+    #     except Exception as e: self.emit_log(f"[ROS2] Subscription error {t}: {e}")
+
+    # for t in drive_topics:
+    #     try:
+    #         sub = self._node.create_subscription(
+    #             Empty, t, lambda _msg, tp=t: self.emit_log(f"[ROS2] {tp} received"), 10
+    #         )
+    #         self._subs.append(sub)
+    #         self.emit_log(f"[ROS2] Subscribed to {t}")
+    #     except Exception as e:
+    #         self.emit_log(f"[ROS2] Subscription error {t}: {e}")
     
     def run(self):
         try:
@@ -367,9 +410,9 @@ class StateManager:
         # 로봇 상태 플래그들
         self.robot_flags = {
             'robot_ok_flag': False,
-            # 'robot_press_flag': False,
             'robot_open_flag': False,
-            'robot_pick_flag': False
+            'robot_pick_flag': False,
+            'robot_fire_done_flag': False
         }
         
         # 카운터들
@@ -606,28 +649,20 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # 버튼들
         self.btn_m3_button = self._create_button("BUTTON: NO")
-        self.btn_m3_fire = self._create_button("FIRE: NO")
+        self.btn_m3_fire = self._create_button("FIRE: (0/3)")
         self.btn_m3_door = self._create_button("DOOR: NO")
         
         # 이벤트 연결
-        self.btn_m3_button.clicked.connect(lambda: self._reset_flag('button_flag', self.btn_m3_button, "BUTTON: NO"))
+        self.btn_m3_button.clicked.connect(lambda: self._reset_flag('button_flag', self.btn_m3_button, 
+                                                                    "BUTTON: NO", self.btn_m3_button_ok,
+                                                                    'robot_ok_flag'))
         self.btn_m3_fire.clicked.connect(self._reset_fire_flag)
-        self.btn_m3_door.clicked.connect(lambda: self._reset_flag('door_flag', self.btn_m3_door, "DOOR: NO"))
-        
+        self.btn_m3_door.clicked.connect(lambda: self._reset_flag('door_flag', self.btn_m3_door, 
+                                                                  "DOOR: NO", self.btn_m3_open,
+                                                                  'robot_open_flag'))
         layout.addWidget(self.btn_m3_button, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
-        layout.addWidget(self.btn_m3_fire, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
-        layout.addWidget(self.btn_m3_door, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
-        
-        # 불 카운터 레이블
-        self.lbl_m3_fire_count = QtWidgets.QLabel("불의 개수: 0 개 (0/3)")
-        font = QtGui.QFont()
-        font.setPointSize(12)
-        font.setBold(True)
-        self.lbl_m3_fire_count.setFont(font)
-        self.lbl_m3_fire_count.setFixedSize(150, 44)
-        self.lbl_m3_fire_count.setWordWrap(True)
-        self.lbl_m3_fire_count.setAlignment(QtCore.Qt.AlignCenter)
-        layout.addWidget(self.lbl_m3_fire_count, alignment=QtCore.Qt.AlignLeft)
+        layout.addWidget(self.btn_m3_fire,   alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        layout.addWidget(self.btn_m3_door,   alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
         
         widget = QtWidgets.QWidget()
         widget.setLayout(layout)
@@ -640,18 +675,30 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
         
-        self.btn_m3_ok_1 = self._create_button("OK", 'robot')
-        self.btn_m3_ok_2 = self._create_button("OK", 'robot')
-        self.btn_m3_open = self._create_button("Open", 'robot')
+        self.btn_m3_button_ok = self._create_button("ButtonEnd", 'robot')
+        self.btn_m3_fire_done = self._create_button("FireEnd", 'robot')
+        self.btn_m3_open      = self._create_button("OpenDoorEnd", 'robot')
         
         # 이벤트 연결
-        self.btn_m3_ok_1.clicked.connect(lambda: self._reset_robot_flag('robot_ok_flag', [self.btn_m3_ok_1, getattr(self, 'btn_m4_ok', None)]))
-        self.btn_m3_ok_2.clicked.connect(lambda: self._reset_robot_flag('robot_ok_flag', [self.btn_m3_ok_2]))
+        self.btn_m3_button_ok.clicked.connect(lambda: self._reset_robot_flag('robot_ok_flag', [self.btn_m3_button_ok, getattr(self, 'btn_m4_ok', None)]))
+        self.btn_m3_fire_done.clicked.connect(lambda: self._reset_robot_flag('robot_fire_done_flag', [self.btn_m3_fire_done]))
         self.btn_m3_open.clicked.connect(lambda: self._reset_robot_flag('robot_open_flag', [self.btn_m3_open]))
         
-        layout.addWidget(self.btn_m3_ok_1, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
-        layout.addWidget(self.btn_m3_ok_2, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
-        layout.addWidget(self.btn_m3_open, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        layout.addWidget(self.btn_m3_button_ok, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        layout.addWidget(self.btn_m3_fire_done, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        layout.addWidget(self.btn_m3_open,      alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+
+
+        # # 불 카운터 레이블
+        # self.lbl_m3_fire_count = QtWidgets.QLabel("불의 개수: 0 개 (0/3)")
+        # font = QtGui.QFont()
+        # font.setPointSize(12)
+        # font.setBold(True)
+        # self.lbl_m3_fire_count.setFont(font)
+        # self.lbl_m3_fire_count.setFixedSize(150, 44)
+        # self.lbl_m3_fire_count.setWordWrap(True)
+        # self.lbl_m3_fire_count.setAlignment(QtCore.Qt.AlignCenter)
+        # layout.addWidget(self.lbl_m3_fire_count, alignment=QtCore.Qt.AlignLeft)
         
         widget = QtWidgets.QWidget()
         widget.setLayout(layout)
@@ -747,11 +794,17 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---------------------------
     # 이벤트 핸들러들 (최적화)
     # ---------------------------
-    def _reset_flag(self, flag_name: str, button: QtWidgets.QPushButton, idle_text: str):
+    def _reset_flag(self, flag_name: str, button: QtWidgets.QPushButton, idle_text: str, 
+                    partner_robot_btn: QtWidgets.QPushButton = None,
+                    partner_robot_flag: str = None):
         """공통 플래그 리셋 함수"""
         self.state.set_flag(flag_name, False)
         button.setText(idle_text)
         button.setStyleSheet(UI_STYLES.DET_IDLE)
+        if partner_robot_btn is not None:
+            partner_robot_btn.setStyleSheet(UI_STYLES.ROBOT_IDLE)
+        if partner_robot_flag:
+            self.state.set_flag(partner_robot_flag, False)
         self._append_log(f"[UI] {flag_name} reset")
     
     def _reset_robot_flag(self, flag_name: str, buttons: List[QtWidgets.QPushButton]):
@@ -763,12 +816,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._append_log(f"[UI] {flag_name} reset")
     
     def _reset_fire_flag(self):
-        """불 플래그 특별 리셋"""
+        """불 플래그/카운터 리셋"""
         self.state.set_flag('fire_flag', False)
         self.state.reset_counter('fire_count')
-        self.btn_m3_fire.setText("FIRE: NO")
+        self.btn_m3_fire.setText("FIRE: (0/3)")
         self.btn_m3_fire.setStyleSheet(UI_STYLES.DET_IDLE)
-        self.lbl_m3_fire_count.setText("불의 개수: 0 개 (0/3)")
+        # fire 완료 로봇 박스도 함께 리셋할지 
+        self.state.set_flag('robot_fire_done_flag', False)
+        self.btn_m3_fire_done.setStyleSheet(UI_STYLES.ROBOT_IDLE)
         self._append_log("[UI] Fire flag and counter reset")
     
     def _reset_human_flag(self):
@@ -834,15 +889,23 @@ class MainWindow(QtWidgets.QMainWindow):
     
     @QtCore.Slot()
     def _on_fire_detected(self):
-        """불 감지"""
-        count = self.state.increment_counter('fire_count')
-        self.lbl_m3_fire_count.setText(f"불의 개수: {count} 개 ({count}/3)")
-        
+        """불 감지: on/off 아무거나 오면 (n/3) 증가, 노랑, 3/3이면 로봇 Fire 초록"""
+        # 카운터 +1 (최대 3으로 캡)
+        n = min(3, self.state.increment_counter('fire_count'))
+
+        # 감지 버튼(빨간→노랑) & 텍스트 갱신
         if not self.state.get_flag('fire_flag'):
             self.state.set_flag('fire_flag', True)
-            self.btn_m3_fire.setText("FIRE: YES")
-            self.btn_m3_fire.setStyleSheet(UI_STYLES.DET_ACTIVE)
+            self.btn_m3_fire.setStyleSheet(UI_STYLES.DET_ACTIVE)  # 노랑
             self._append_log("[ROS2] Fire detected!")
+        self.btn_m3_fire.setText(f"FIRE: ({n}/3)")
+
+        # 3/3 도달 시 로봇 Fire 박스 초록
+        if n >= 3 and not self.state.get_flag('robot_fire_done_flag'):
+            self.state.set_flag('robot_fire_done_flag', True)
+            if hasattr(self, 'btn_m3_fire_done'):
+                self.btn_m3_fire_done.setStyleSheet(UI_STYLES.ROBOT_ACTIVE)  # 초록
+            self._append_log("[ROS2] Fire 3/3 completed -> Robot Fire DONE")
     
     @QtCore.Slot()
     def _on_door_detected(self):
@@ -883,6 +946,27 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_m4_finish.setText("FINISH: YES")
             self.btn_m4_finish.setStyleSheet(UI_STYLES.DET_ACTIVE)
             self._append_log("[ROS2] Finish detected!")
+
+    @QtCore.Slot()
+    def _on_robot_button_end(self):
+        """로봇암: 버튼 작업 완료 → ButtonEnd 초록"""
+        if not self.state.get_flag('robot_ok_flag'):
+            self.state.set_flag('robot_ok_flag', True)
+            if hasattr(self, 'btn_m3_button_ok'):
+                self.btn_m3_button_ok.setStyleSheet(UI_STYLES.ROBOT_ACTIVE)
+            # (mission4 OK 박스도 함께 초록으로 하고 싶으면 아래 켜기)
+            # if hasattr(self, 'btn_m4_ok'):
+            #     self.btn_m4_ok.setStyleSheet(UI_STYLES.ROBOT_ACTIVE)
+            self._append_log("[ROS2] /robot_arm/button_end -> ButtonEnd green")
+
+    @QtCore.Slot()
+    def _on_robot_open_door_end(self):
+        """로봇암: 문 열기 완료 → OpenDoor 초록"""
+        if not self.state.get_flag('robot_open_flag'):
+            self.state.set_flag('robot_open_flag', True)
+            if hasattr(self, 'btn_m3_open'):
+                self.btn_m3_open.setStyleSheet(UI_STYLES.ROBOT_ACTIVE)
+            self._append_log("[ROS2] /robot_arm/open_door_end -> OpenDoor green")
     
     ############# 버튼 인식, 보급 상자 인식이 되면 터미널에 로그를 출력 ############
     @QtCore.Slot()
@@ -974,11 +1058,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ros_thread.human_detected.connect(self._on_human_detected)
             self.ros_thread.finish_detected.connect(self._on_finish_detected)
             
-            # 로봇 상태 시그널 연결
-            self.ros_thread.robot_ok.connect(self._on_robot_ok)
-            self.ros_thread.robot_open.connect(self._on_robot_open)
-            self.ros_thread.robot_pick.connect(self._on_robot_pick)
-            
+            # # 로봇 상태 시그널 연결
+            # self.ros_thread.robot_ok.connect(self._on_robot_ok)
+            # self.ros_thread.robot_open.connect(self._on_robot_open)
+            # self.ros_thread.robot_pick.connect(self._on_robot_pick)
+
+            # --- mission3 전용 로봇암 완료 ---
+            self.ros_thread.robot_button_end.connect(self._on_robot_button_end)         # ← 추가
+            self.ros_thread.robot_open_door_end.connect(self._on_robot_open_door_end)   # ← 추가
+                    
             self.ros_thread.start()
             self._append_log("[ROS2] All-topic subscriber started")
         except Exception as e:
