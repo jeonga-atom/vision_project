@@ -1,8 +1,8 @@
 import sys
-import os
-import time
 from datetime import datetime
-from functools import partial
+from typing import List, Optional
+from dataclasses import dataclass
+from enum import Enum
 
 from PySide6 import QtCore, QtGui, QtWidgets
 import zmq
@@ -10,209 +10,277 @@ import base64
 import numpy as np
 import cv2
 
-## 로봇팔 토픽 ##
+# ---------------------------
+# Configuration & Constants
+# ---------------------------
+@dataclass
+class ButtonConfig:
+    """버튼 설정 클래스"""
+    flag_name: str
+    button_name: str
+    text_idle: str
+    text_active: str
+    button_type: str = 'detection'  # 'detection' or 'robot'
+
+@dataclass
+class UIStyles:
+    """UI 스타일 상수"""
+    DET_IDLE: str = "color: white; background: darkred;"
+    DET_ACTIVE: str = "color: black; background: yellow;"
+    ROBOT_IDLE: str = "color: black; background: white; border:1px solid #8b1f1f; padding:6px;"
+    ROBOT_ACTIVE: str = "color: white; background: #2ecc71; border:1px solid #1e8449; padding:6px;"
+
+class MissionType(Enum):
+    MISSION1 = 0
+    MISSION2 = 1  
+    MISSION3 = 2
+    MISSION4 = 3
+
+# 설정 집중화
+UI_STYLES = UIStyles()
+
+BUTTON_CONFIGS = {
+    'SOS': ButtonConfig('sos_flag', 'btn_m1_sos', 'SOS: NO', 'SOS: YES'),
+    'Button': ButtonConfig('button_flag', 'btn_m3_button', 'BUTTON: NO', 'BUTTON: YES'),
+    'Fire': ButtonConfig('fire_flag', 'btn_m3_fire', 'FIRE: NO', 'FIRE: YES'),
+    'Door': ButtonConfig('door_flag', 'btn_m3_door', 'DOOR: NO', 'DOOR: YES'),
+    'Safebox': ButtonConfig('safebox_flag', 'btn_m4_safebox', 'SAFEBOX: NO', 'SAFEBOX: YES'),
+    'Human': ButtonConfig('human_flag', 'btn_m4_human', 'HUMAN: NO', 'HUMAN: YES'),
+    'Finish': ButtonConfig('finish_flag', 'btn_m4_finish', 'FINISH: NO', 'FINISH: YES'),
+    'OK': ButtonConfig('robot_ok_flag', 'btn_ok', 'OK', 'OK', 'robot'),
+    'Open': ButtonConfig('robot_open_flag', 'btn_m3_open', 'Open', 'Open', 'robot'),
+    'Pick': ButtonConfig('robot_pick_flag', 'btn_m4_pick', 'Pick', 'Pick', 'robot'),
+}
+
 DEFAULT_ROS_TOPICS = {
     'ok': '/robot/ok',
-    'press': '/robot/press',
     'open': '/robot/open',
     'pick': '/robot/pick'
 }
 
 # ---------------------------
-# ZMQ 메시지를 백그라운드에서 수신 (정확 매칭 로직)
+# 공통 베이스 클래스
 # ---------------------------
-class ZmqSubscriberThread(QtCore.QThread):
-    frame_received = QtCore.Signal(object)   # emit((topic, frame_ndarray))
+class BaseSubscriberThread(QtCore.QThread):
+    """공통 구독자 스레드 베이스 클래스"""
     text_received = QtCore.Signal(str)
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._stop = False
+    
+    def stop(self):
+        self._stop = True
+    
+    def emit_log(self, message: str):
+        """로그 메시지 발송"""
+        self.text_received.emit(message)
 
-    def __init__(self, endpoints, context=None, parent=None):
+# ---------------------------
+# ZMQ 구독자 (최적화)
+# ---------------------------
+class ZmqSubscriberThread(BaseSubscriberThread):
+    frame_received = QtCore.Signal(object)
+    
+    def __init__(self, endpoints: List[str], context=None, parent=None):
         super().__init__(parent)
         self.endpoints = list(endpoints)
-        self._stop = False
-        self._ctx_owned = False
-        if context is None:
-            self.context = zmq.Context(io_threads=1)
-            self._ctx_owned = True
-        else:
-            self.context = context
-        self._sock_to_ep = {}
-
-    def stop(self): # 외부에서 종료 요청을 할 때 호출
-        self._stop = True
-
+        self._ctx_owned = context is None
+        self.context = context or zmq.Context(io_threads=1)
+        
+    def _decode_frame(self, payload_bytes: bytes) -> Optional[np.ndarray]:
+        """프레임 디코딩 최적화"""
+        if not payload_bytes:
+            return None
+            
+        # Base64 디코딩 시도
+        try:
+            jpg_bytes = base64.b64decode(payload_bytes, validate=False)
+            np_arr = np.frombuffer(jpg_bytes, dtype=np.uint8)
+            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            if frame is not None:
+                return frame
+        except Exception:
+            pass
+        
+        # 직접 바이너리 디코딩 시도
+        try:
+            np_arr = np.frombuffer(payload_bytes, dtype=np.uint8)
+            return cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        except Exception as e:
+            self.emit_log(f"[ZMQ] Frame decode failed: {e}")
+            return None
+    
     def run(self):
         sockets = []
         poller = zmq.Poller()
+        
         try:
+            # 소켓 초기화
             for ep in self.endpoints:
                 try:
                     sock = self.context.socket(zmq.SUB)
                     sock.setsockopt(zmq.RCVHWM, 50)
                     sock.linger = 0
                     sock.connect(ep)
-                    sock.setsockopt_string(zmq.SUBSCRIBE, "")  # 모든 프레임 수신
+                    sock.setsockopt_string(zmq.SUBSCRIBE, "")
                     poller.register(sock, zmq.POLLIN)
                     sockets.append(sock)
-                    self._sock_to_ep[sock] = ep
-                    self.text_received.emit(f"[ZMQ] connected {ep} (image only)")
+                    self.emit_log(f"[ZMQ] Connected to {ep}")
                 except Exception as e:
-                    self.text_received.emit(f"[ZMQ] connect error {ep}: {e}")
-                    return
-
-            while not self._stop:
-                events = dict(poller.poll(timeout=200))
-                if not events:
+                    self.emit_log(f"[ZMQ] Connection error {ep}: {e}")
                     continue
-
-                for sock in list(events.keys()):
-                    if events[sock] & zmq.POLLIN:
-                        try:
-                            msg = sock.recv_multipart(flags=0)
-                            payload_bytes = msg[-1] if len(msg) >= 1 else b""
-
-                            frame = None
+            
+            # 메인 루프
+            while not self._stop:
+                try:
+                    events = dict(poller.poll(timeout=200))
+                    if not events:
+                        continue
+                    
+                    for sock in events:
+                        if events[sock] & zmq.POLLIN:
                             try:
-                                jpg_bytes = base64.b64decode(payload_bytes, validate=False)
-                                np_arr = np.frombuffer(jpg_bytes, dtype=np.uint8)
-                                frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-                            except Exception:
-                                try:
-                                    np_arr = np.frombuffer(payload_bytes, dtype=np.uint8)
-                                    frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-                                except Exception as e2:
-                                    self.text_received.emit(f"[ZMQ] frame decode error: {e2}")
-
-                            if frame is not None:
-                                self.frame_received.emit(("camera", frame))
-                        except Exception as e:
-                            self.text_received.emit(f"[ZMQ] recv error: {e}")
+                                msg = sock.recv_multipart(flags=zmq.NOBLOCK)
+                                payload = msg[-1] if msg else b""
+                                
+                                frame = self._decode_frame(payload)
+                                if frame is not None:
+                                    self.frame_received.emit(("camera", frame))
+                                    
+                            except zmq.Again:
+                                continue
+                            except Exception as e:
+                                self.emit_log(f"[ZMQ] Receive error: {e}")
+                                
+                except Exception as e:
+                    self.emit_log(f"[ZMQ] Poll error: {e}")
+                    
         finally:
-            for s in sockets:
-                try: poller.unregister(s)
-                except: pass
-                try: s.close(0)
-                except:pass
-            if self._ctx_owned:
-                try: self.context.term()
-                except: pass
-            self.text_received.emit("[ZMQ] subscriber thread terminated.")
-
+            self._cleanup_sockets(sockets, poller)
+            self.emit_log("[ZMQ] Thread terminated")
+    
+    def _cleanup_sockets(self, sockets: List, poller: zmq.Poller):
+        """소켓 정리"""
+        for sock in sockets:
+            try:
+                poller.unregister(sock)
+                sock.close(0)
+            except:
+                pass
+        
+        if self._ctx_owned:
+            try:
+                self.context.term()
+            except:
+                pass
 
 # ---------------------------
-# ROS2 (rclpy) ROS2 토픽을 백그라운드에서 구독
+# ROS2 구독자 (최적화)
 # ---------------------------
-class Ros2SubscriberThread(QtCore.QThread):
-    # 탐지 시그널
-    sos_detected     = QtCore.Signal()
-    button_detected  = QtCore.Signal()
-    fire_detected    = QtCore.Signal()
-    door_detected    = QtCore.Signal()
+class Ros2SubscriberThread(BaseSubscriberThread):
+    # 탐지 시그널들
+    sos_detected = QtCore.Signal()
+    button_detected = QtCore.Signal()
+    fire_detected = QtCore.Signal()
+    door_detected = QtCore.Signal()
     safebox_detected = QtCore.Signal()
-    human_detected   = QtCore.Signal()
-    finish_detected  = QtCore.Signal()
-
-    # 로봇 상태 시그널
-    robot_ok    = QtCore.Signal()
-    robot_press = QtCore.Signal()
-    robot_open  = QtCore.Signal()
-    robot_pick  = QtCore.Signal()
-
-    text_received = QtCore.Signal(str)
-
+    human_detected = QtCore.Signal()
+    finish_detected = QtCore.Signal()
+    
+    # 로봇 상태 시그널들
+    robot_ok = QtCore.Signal()
+    robot_open = QtCore.Signal()
+    robot_pick = QtCore.Signal()
+    
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._stop = False
-        self._rclpy_inited = False
         self._node = None
         self._subs = []
-
-    def stop(self):
-        self._stop = True
-
+        
+    def _create_subscriptions(self):
+        """구독 생성 (중복 코드 제거)"""
+        # 탐지 토픽들
+        detection_topics = {
+            '/object_detection/SOS': self.sos_detected,
+            '/object_detection/button': self.button_detected,
+            '/object_detection/fire': self.fire_detected,
+            '/object_detection/door': self.door_detected,
+            '/object_detection/safebox': self.safebox_detected,
+            '/object_detection/human': self.human_detected,
+            '/object_detection/finish': self.finish_detected,
+        }
+        
+        # 로봇 상태 토픽들
+        robot_topics = {
+            '/robot/ok': self.robot_ok,
+            '/robot/open': self.robot_open,
+            '/robot/pick': self.robot_pick,
+        }
+        
+        # 모든 토픽 구독
+        all_topics = {**detection_topics, **robot_topics}
+        
+        for topic, signal in all_topics.items():
+            try:
+                from std_msgs.msg import Empty
+                sub = self._node.create_subscription(
+                    Empty, topic,
+                    lambda msg, sig=signal: sig.emit(),
+                    10
+                )
+                self._subs.append(sub)
+                self.emit_log(f"[ROS2] Subscribed to {topic}")
+            except Exception as e:
+                self.emit_log(f"[ROS2] Subscription error {topic}: {e}")
+    
     def run(self):
         try:
             import rclpy
-            from std_msgs.msg import Empty  # ← Empty 타입 필수
-        except Exception as e:
-            self.text_received.emit(f"[ROS2] rclpy not available: {e}")
+            from std_msgs.msg import Empty
+        except ImportError as e:
+            self.emit_log(f"[ROS2] Import error: {e}")
             return
-
+        
         try:
+            # ROS2 초기화
             try:
                 rclpy.init(args=None)
-                self._rclpy_inited = True
-            except Exception:
-                self._rclpy_inited = True
-
-            try:
-                self._node = rclpy.create_node('ui_subscriber')
-            except Exception as e:
-                self.text_received.emit(f"[ROS2] create_node failed: {e}")
-                return
-
-            # -------------------------
-            # Object detection 토픽들 (모두 Empty)
-            # -------------------------
-            topics_det = {
-                '/object_detection/SOS'     : self.sos_detected,
-                '/object_detection/button'  : self.button_detected,
-                '/object_detection/fire'    : self.fire_detected,
-                '/object_detection/door'    : self.door_detected,
-                '/object_detection/safebox' : self.safebox_detected,
-                '/object_detection/human'   : self.human_detected,
-                '/object_detection/finish'  : self.finish_detected,
-            }
-
-            for t, sig in topics_det.items():
-                try:
-                    sub = self._node.create_subscription(
-                        Empty, t, lambda msg, s=sig, tn=t: s.emit(), 10
-                    )
-                    self._subs.append(sub)
-                    self.text_received.emit(f"[ROS2] Subscribed to {t}")
-                except Exception as e:
-                    self.text_received.emit(f"[ROS2] subscription error {t}: {e}")
-
-            # -------------------------
-            # Robot 상태 토픽들 (모두 Empty)
-            # -------------------------
-            topics_robot = {
-                '/robot/ok'   : self.robot_ok,
-                '/robot/press': self.robot_press,
-                '/robot/open' : self.robot_open,
-                '/robot/pick' : self.robot_pick,
-            }
-            for t, sig in topics_robot.items():
-                try:
-                    sub = self._node.create_subscription(
-                        Empty, t, lambda msg, s=sig, tn=t: s.emit(), 10
-                    )
-                    self._subs.append(sub)
-                    self.text_received.emit(f"[ROS2] Subscribed to {t}")
-                except Exception as e:
-                    self.text_received.emit(f"[ROS2] subscription error {t}: {e}")
-
+            except:
+                pass  # 이미 초기화된 경우
+            
+            self._node = rclpy.create_node('ui_subscriber')
+            self._create_subscriptions()
+            
+            # 메인 루프
             while not self._stop and rclpy.ok():
-                rclpy.spin_once(self._node, timeout_sec=0.1)
-
+                try:
+                    rclpy.spin_once(self._node, timeout_sec=0.1)
+                except Exception as e:
+                    self.emit_log(f"[ROS2] Spin error: {e}")
+                    
         except Exception as e:
-            self.text_received.emit(f"[ROS2] runtime error: {e}")
+            self.emit_log(f"[ROS2] Runtime error: {e}")
         finally:
+            self._cleanup()
+            self.emit_log("[ROS2] Thread terminated")
+    
+    def _cleanup(self):
+        """리소스 정리"""
+        if self._node:
             try:
-                if self._node is not None:
-                    try: self._node.destroy_node()
-                    except: pass
-            except: pass
-            try:
-                if self._rclpy_inited:
-                    import rclpy
-                    try: rclpy.shutdown()
-                    except: pass
-            except: pass
-            self.text_received.emit("[ROS2] subscriber thread terminated.")
+                self._node.destroy_node()
+            except:
+                pass
+        
+        try:
+            import rclpy
+            rclpy.shutdown()
+        except:
+            pass
 
 # ---------------------------
-# GUI widgets, 수신한 카메라 영상 데이터를 화면에 표시
+# 최적화된 카메라 레이블
 # ---------------------------
 class CameraLabel(QtWidgets.QLabel):
     def __init__(self, placeholder_text="No Image", parent=None):
@@ -221,712 +289,739 @@ class CameraLabel(QtWidgets.QLabel):
         self.setText(placeholder_text)
         self.setMinimumSize(640, 480)
         self.setStyleSheet("background-color: #111; color: #eee;")
-
+        self._current_pixmap = None
+        
     def show_frame(self, frame_bgr: np.ndarray):
-        # 안전검사
-        if frame_bgr is None or not isinstance(frame_bgr, np.ndarray) or frame_bgr.size == 0:
-            self.clear()
-            self.setText("No Image")
+        """프레임 표시 최적화"""
+        if not self._is_valid_frame(frame_bgr):
+            self._show_no_image()
             return
-
+        
         try:
-            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            rgb = np.ascontiguousarray(rgb)
-            h, w, ch = rgb.shape
-            bytes_per_line = ch * w
-            qimg = QtGui.QImage(rgb.data, w, h, bytes_per_line, QtGui.QImage.Format_RGB888)
+            qimg = self._convert_frame_to_qimage(frame_bgr)
             if qimg.isNull():
-                self.clear()
-                self.setText("No Image")
+                self._show_no_image()
                 return
-            pix = QtGui.QPixmap.fromImage(qimg.copy())
-            if pix.isNull():
-                self.clear()
-                self.setText("No Image")
-                return
-            scaled = pix.scaled(self.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
-            self.setPixmap(scaled)
+            
+            pixmap = QtGui.QPixmap.fromImage(qimg)
+            self._current_pixmap = pixmap
+            self._update_display()
+            
         except Exception as e:
-            # 개발 시 디버깅 로그
-            print(f"[CameraLabel] show_frame error: {e}", file=sys.stderr)
-            self.clear()
-            self.setText("No Image")
-
-    def resizeEvent(self, ev):
-        pm = self.pixmap()
-        if pm is not None and not pm.isNull():
-            scaled = pm.scaled(self.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+            print(f"[CameraLabel] Error: {e}", file=sys.stderr)
+            self._show_no_image()
+    
+    def _is_valid_frame(self, frame: np.ndarray) -> bool:
+        """프레임 유효성 검사"""
+        return (frame is not None and 
+                isinstance(frame, np.ndarray) and 
+                frame.size > 0)
+    
+    def _convert_frame_to_qimage(self, frame_bgr: np.ndarray) -> QtGui.QImage:
+        """BGR 프레임을 QImage로 변환"""
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        rgb = np.ascontiguousarray(rgb)
+        h, w, ch = rgb.shape
+        bytes_per_line = ch * w
+        return QtGui.QImage(rgb.data, w, h, bytes_per_line, QtGui.QImage.Format_RGB888)
+    
+    def _show_no_image(self):
+        """이미지 없음 표시"""
+        self.clear()
+        self.setText("No Image")
+        self._current_pixmap = None
+    
+    def _update_display(self):
+        """디스플레이 업데이트"""
+        if self._current_pixmap and not self._current_pixmap.isNull():
+            scaled = self._current_pixmap.scaled(
+                self.size(), 
+                QtCore.Qt.KeepAspectRatio, 
+                QtCore.Qt.SmoothTransformation
+            )
             self.setPixmap(scaled)
-        super().resizeEvent(ev)
-
+    
+    def resizeEvent(self, event):
+        """리사이즈 이벤트 처리"""
+        self._update_display()
+        super().resizeEvent(event)
 
 # ---------------------------
-# Main Window, 프로그램의 메인 창 UI를 만들고 백그라운드 스레드 관리
+# UI 상태 관리자
+# ---------------------------
+class StateManager:
+    """UI 상태 관리 클래스"""
+    
+    def __init__(self):
+        # 감지 플래그들
+        self.detection_flags = {
+            'sos_flag': False,
+            'button_flag': False, 
+            'fire_flag': False,
+            'door_flag': False,
+            'safebox_flag': False,
+            'human_flag': False,
+            'finish_flag': False
+        }
+        
+        # 로봇 상태 플래그들
+        self.robot_flags = {
+            'robot_ok_flag': False,
+            # 'robot_press_flag': False,
+            'robot_open_flag': False,
+            'robot_pick_flag': False
+        }
+        
+        # 카운터들
+        self.counters = {
+            'fire_count': 0,
+            'human_count': 0
+        }
+    
+    def set_flag(self, flag_name: str, value: bool):
+        """플래그 설정"""
+        if flag_name in self.detection_flags:
+            self.detection_flags[flag_name] = value
+        elif flag_name in self.robot_flags:
+            self.robot_flags[flag_name] = value
+    
+    def get_flag(self, flag_name: str) -> bool:
+        """플래그 조회"""
+        return (self.detection_flags.get(flag_name, False) or 
+                self.robot_flags.get(flag_name, False))
+    
+    def increment_counter(self, counter_name: str) -> int:
+        """카운터 증가"""
+        if counter_name in self.counters:
+            self.counters[counter_name] += 1
+            return self.counters[counter_name]
+        return 0
+    
+    def reset_counter(self, counter_name: str):
+        """카운터 리셋"""
+        if counter_name in self.counters:
+            self.counters[counter_name] = 0
+    
+    def reset_all(self):
+        """모든 상태 리셋"""
+        for key in self.detection_flags:
+            self.detection_flags[key] = False
+        for key in self.robot_flags:
+            self.robot_flags[key] = False
+        for key in self.counters:
+            self.counters[key] = 0
+
+# ---------------------------
+# 메인 윈도우 (최적화)
 # ---------------------------
 class MainWindow(QtWidgets.QMainWindow):
-    DEFAULT_RESET_FLAG = {
-        'SOS'     : {'flags': 'sos_flag',              'btn': 'btn_m1_sos',   'text': 'SOS: NO',    'type': 'detection'},
-        'Button'  : {'flags': 'button_flag',           'btn': 'btn_m3_button','text': 'BUTTON: NO', 'type': 'detection'},
-        'Fire'    : {'flags': 'fire_flag',             'btn': 'btn_m3_fire',  'text': 'FIRE: NO',   'type': 'detection'},
-        'Door'    : {'flags': 'door_flag',             'btn': 'btn_m3_door',  'text': 'DOOR: NO',   'type': 'detection'},
-        'Safebox' : {'flags': 'safebox_flag',          'btn': 'btn_m4_safebox','text': 'SAFEBOX: NO','type': 'detection'},
-        'Human'   : {'flags': 'human_flag',            'btn': 'btn_m4_human', 'text': 'HUMAN: NO',  'type': 'detection'},
-        'Finish'  : {'flags': 'finish_flag',           'btn': 'btn_m4_finish','text': 'FINISH: NO', 'type': 'detection'},
-
-        'OK'      : {'flags': 'robot_m3_ok_flag',      'btn': 'btn_m3_ok',  'type': 'robot'},
-        'Press'   : {'flags': 'robot_m3_press_flag',   'btn': 'btn_m3_press', 'type': 'robot'},
-        'Open'    : {'flags': 'robot_m3_open_flag',    'btn': 'btn_m3_open',  'type': 'robot'},
-        'Pick'    : {'flags': 'robot_m4_pick_flag',    'btn': 'btn_m4_pick', 'type': 'robot'},
-    }
-    ## 여기서 값들 수정 ##
-
-    def __init__(self, zmq_endpoints, ros_topics=None):
+    def __init__(self, zmq_endpoints: List[str], ros_topics=None):
         super().__init__()
-        self.setWindowTitle("ZMQ + ROS2 Humble Viewer (Aligned) - with EMERGENCY STOP")
+        self.setWindowTitle("ZMQ + ROS2 Viewer (Optimized)")
         self.resize(1000, 700)
-
-        # Left: camera + control
-        self.main_cam = CameraLabel("Main camera")
+        
+        # 상태 관리자
+        self.state = StateManager()
+        
+        # 설정
+        self.zmq_endpoints = zmq_endpoints
+        self.ros_topics = ros_topics or DEFAULT_ROS_TOPICS
+        
+        # 스레드
+        self.zmq_thread = None
+        self.ros_thread = None
+        
+        # UI 초기화
+        self._init_ui()
+        self._connect_signals()
+        
+        # 종료 시 정리
+        QtCore.QCoreApplication.instance().aboutToQuit.connect(self._cleanup)
+    
+    def _init_ui(self):
+        """UI 초기화"""
+        # 중앙 위젯
+        central = QtWidgets.QWidget()
+        main_layout = QtWidgets.QHBoxLayout(central)
+        
+        # 왼쪽: 카메라 + 컨트롤
+        left_widget = self._create_left_panel()
+        
+        # 오른쪽: 탭 + 미션 + 로그
+        right_widget = self._create_right_panel()
+        
+        main_layout.addWidget(left_widget, stretch=3)
+        main_layout.addWidget(right_widget, stretch=1)
+        self.setCentralWidget(central)
+    
+    def _create_left_panel(self) -> QtWidgets.QWidget:
+        """왼쪽 패널 생성"""
+        self.main_cam = CameraLabel("Main Camera")
+        
+        # 컨트롤 버튼들
         self.start_btn = QtWidgets.QPushButton("Start")
         self.stop_btn = QtWidgets.QPushButton("Stop")
-        # self.stop_btn.setEnabled(False)
-
+        
         btn_layout = QtWidgets.QHBoxLayout()
         btn_layout.addWidget(self.start_btn)
         btn_layout.addWidget(self.stop_btn)
         btn_layout.addStretch()
-
-        left_layout = QtWidgets.QVBoxLayout()
-        left_layout.addWidget(self.main_cam, stretch=1)
-        left_layout.addLayout(btn_layout)
-        left_widget = QtWidgets.QWidget()
-        left_widget.setLayout(left_layout)
-
-        # Right: tabbar + mission stack + log + emergency stop
-        right_layout = QtWidgets.QVBoxLayout()
-
-        # Tabs
-        self.tab_bar = QtWidgets.QTabBar()
-        self.tab_bar.setExpanding(False)
-        self.tab_bar.setDrawBase(False)
-        self.tab_bar.setFixedHeight(34)
-        for name in ("mission1", "mission2", "mission3", "mission4"):
-            self.tab_bar.addTab(name)
-        self.tab_bar.setCurrentIndex(0)
-
-        self.mission_stack = QtWidgets.QStackedWidget()
-
-        # common font (same for detection and robot buttons)
-        common_font = QtGui.QFont()
-        common_font.setPointSize(12)
-        common_font.setBold(True)
-
-        # styles
-        self.det_idle_style = "color: white; background: darkred;"
-        self.det_active_style = "color: black; background: yellow;"
-        # robot initial: white background, dark border, same font/size; active: green
-        self.robot_idle_style = "color: black; background: white; border:1px solid #8b1f1f; padding:6px;"
-        self.robot_active_style = "color: white; background: #2ecc71; border:1px solid #1e8449; padding:6px;"
-
-        # create pages
-        for i in range(4):
-            pg = QtWidgets.QWidget()
-            l = QtWidgets.QHBoxLayout()
-            l.setContentsMargins(0, 0, 0, 0)
-
-            if i == 0:
-                # mission1: SOS positioned like mission3 buttons (left/top aligned)
-                vbox = QtWidgets.QVBoxLayout()
-                vbox.setContentsMargins(0,0,0,0)
-                vbox.setSpacing(6)
-
-                self.btn_m1_sos = QtWidgets.QPushButton("SOS: NO")
-                self.btn_m1_sos.setEnabled(True)
-                self.btn_m1_sos.setFixedSize(150, 44)
-                self.btn_m1_sos.setFont(common_font)
-                self.btn_m1_sos.setStyleSheet(self.det_idle_style)
-                self.btn_m1_sos.clicked.connect(self.reset_sos_flag)
-                vbox.addWidget(self.btn_m1_sos, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
-
-                wrapper = QtWidgets.QWidget()
-                wrapper.setLayout(vbox)
-                wrapper.setFixedWidth(150)
-                wrapper.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
-                l.addWidget(wrapper, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
-
-            elif i == 2:
-                # mission3: left column detection buttons + right column robot status buttons
-                left_vbox_m3 = QtWidgets.QVBoxLayout()      # 세로 방향으로 위젯 쌓는 레이아웃 객체 생성
-                left_vbox_m3.setContentsMargins(0,0,0,0)    # 상하좌우 여백을 0으로 설정
-                left_vbox_m3.setSpacing(6)                  # 간격 6으로 설정
-
-                self.btn_m3_button = QtWidgets.QPushButton("BUTTON: NO")    # 버튼 생성
-                self.btn_m3_button.setFixedSize(150, 44)                    # 버튼 크기: 150x44
-                self.btn_m3_button.setFont(common_font)                     # 버튼 폰트
-                self.btn_m3_button.setStyleSheet(self.det_idle_style)       # 버튼 글씨체, 색깔 등
-                self.btn_m3_button.clicked.connect(self.reset_button_flag)        # 기능
-                left_vbox_m3.addWidget(self.btn_m3_button, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)  #생성한 버튼을 레이아웃에 추가, alignment로 왼쪽 상단 정렬, 각 위젯이 수직으로 쌓임.
-
-                self.btn_m3_fire = QtWidgets.QPushButton("FIRE: NO")
-                self.btn_m3_fire.setFixedSize(150, 44)
-                self.btn_m3_fire.setFont(common_font)
-                self.btn_m3_fire.setStyleSheet(self.det_idle_style)
-                self.btn_m3_fire.clicked.connect(self.reset_fire_flag)
-                left_vbox_m3.addWidget(self.btn_m3_fire, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
-
-                self.btn_m3_door = QtWidgets.QPushButton("DOOR: NO")
-                self.btn_m3_door.setFixedSize(150, 44)
-                self.btn_m3_door.setFont(common_font)
-                self.btn_m3_door.setStyleSheet(self.det_idle_style)
-                self.btn_m3_door.clicked.connect(self.reset_door_flag)
-                left_vbox_m3.addWidget(self.btn_m3_door, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
-
-                # 불의 개수 세는 코드
-                self.fire_count = 0  # 불 감지 카운터 (초기값)
-                self.lbl_m3_fire_count = QtWidgets.QLabel("불의 개수: 0 개 (0/3)")
-                self.lbl_m3_fire_count.setFont(common_font)
-                self.lbl_m3_fire_count.setFixedSize(150, 44)
-                self.lbl_m3_fire_count.setWordWrap(True)
-                self.lbl_m3_fire_count.setAlignment(QtCore.Qt.AlignCenter)
-                left_vbox_m3.addWidget(self.lbl_m3_fire_count, alignment=QtCore.Qt.AlignLeft)
-                ####################
-
-                left_wrapper_m3 = QtWidgets.QWidget()
-                left_wrapper_m3.setLayout(left_vbox_m3)
-                left_wrapper_m3.setFixedWidth(150)
-                left_wrapper_m3.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
-
-                # right column (robot status) for mission3
-                robot_vbox_m3 = QtWidgets.QVBoxLayout()
-                robot_vbox_m3.setContentsMargins(0,0,0,0)
-                robot_vbox_m3.setSpacing(6)
-                robot_vbox_m3.setAlignment(QtCore.Qt.AlignTop)  # 상단에 강제로 고정
-
-                self.btn_m3_ok = QtWidgets.QPushButton("OK")
-                self.btn_m3_ok.setFixedSize(150, 44)
-                self.btn_m3_ok.setFont(common_font)
-                self.btn_m3_ok.setStyleSheet(self.robot_idle_style)
-                self.btn_m3_ok.clicked.connect(self.reset_robot_ok_flag)
-                robot_vbox_m3.addWidget(self.btn_m3_ok, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
-
-                self.btn_m3_press = QtWidgets.QPushButton("Press")
-                self.btn_m3_press.setFixedSize(150, 44)
-                self.btn_m3_press.setFont(common_font)
-                self.btn_m3_press.setStyleSheet(self.robot_idle_style)
-                self.btn_m3_press.clicked.connect(self.reset_robot_press_flag)
-                robot_vbox_m3.addWidget(self.btn_m3_press, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
-
-                self.btn_m3_open = QtWidgets.QPushButton("Open")
-                self.btn_m3_open.setFixedSize(150, 44)
-                self.btn_m3_open.setFont(common_font)
-                self.btn_m3_open.setStyleSheet(self.robot_idle_style)
-                self.btn_m3_open.clicked.connect(self.reset_robot_open_flag)
-                robot_vbox_m3.addWidget(self.btn_m3_open, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
-
-                right_wrapper_m3 = QtWidgets.QWidget()
-                right_wrapper_m3.setLayout(robot_vbox_m3)
-                right_wrapper_m3.setFixedWidth(150)
-                right_wrapper_m3.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Minimum)  # Fixed -> Minimum
-
-                # Put left and right wrappers into an HBox
-                h_inner_m3 = QtWidgets.QHBoxLayout()
-                h_inner_m3.setContentsMargins(0,0,0,0)
-                h_inner_m3.setSpacing(12)
-                h_inner_m3.addWidget(left_wrapper_m3, 0, QtCore.Qt.AlignTop)    # 수정
-                h_inner_m3.addWidget(right_wrapper_m3, 0, QtCore.Qt.AlignTop)   # 수정
-
-                container_m3 = QtWidgets.QWidget()
-                container_m3.setLayout(h_inner_m3)
-                # container_m3.setFixedWidth(150 + 12 + 150)
-                container_m3.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Minimum)  # Fixed -> Minimum
-
-                l.addWidget(container_m3, alignment=QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
-
-            elif i == 3:
-                # mission4: left detection (SAFEBOX/HUMAN/FINISH) + right robot status (OK/PICK)
-                left_vbox_m4 = QtWidgets.QVBoxLayout()
-                left_vbox_m4.setContentsMargins(0,0,0,0)
-                left_vbox_m4.setSpacing(6)
-
-                self.btn_m4_safebox = QtWidgets.QPushButton("SAFEBOX: NO")
-                self.btn_m4_safebox.setFixedSize(150, 44)
-                self.btn_m4_safebox.setFont(common_font)
-                self.btn_m4_safebox.setStyleSheet(self.det_idle_style)
-                self.btn_m4_safebox.clicked.connect(self.reset_safebox_flag)
-                left_vbox_m4.addWidget(self.btn_m4_safebox, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
-
-                self.btn_m4_human = QtWidgets.QPushButton("HUMAN: NO")
-                self.btn_m4_human.setFixedSize(150, 44)
-                self.btn_m4_human.setFont(common_font)
-                self.btn_m4_human.setStyleSheet(self.det_idle_style)
-                self.btn_m4_human.clicked.connect(self.reset_human_flag)
-                left_vbox_m4.addWidget(self.btn_m4_human, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
-
-                self.btn_m4_finish = QtWidgets.QPushButton("FINISH: NO")
-                self.btn_m4_finish.setFixedSize(150, 44)
-                self.btn_m4_finish.setFont(common_font)
-                self.btn_m4_finish.setStyleSheet(self.det_idle_style)
-                self.btn_m4_finish.clicked.connect(self.reset_finish_flag)
-                left_vbox_m4.addWidget(self.btn_m4_finish, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
-
-                # 사람 명수 세는 코드
-                self.human_count = 0  # 사람 감지 카운터 (초기값)
-                self.lbl_m4_human_count = QtWidgets.QLabel("사람: 0 명 (0/3)")
-                self.lbl_m4_human_count.setFont(common_font)
-                self.lbl_m4_human_count.setFixedSize(150, 44)
-                self.lbl_m4_human_count.setWordWrap(True)
-                self.lbl_m4_human_count.setAlignment(QtCore.Qt.AlignCenter)
-                left_vbox_m4.addWidget(self.lbl_m4_human_count, alignment=QtCore.Qt.AlignLeft)
-
-                self.human_state = 0
-                self.lbl_m4_human_state = QtWidgets.QLabel("상태: 생존 / 사망")
-                self.lbl_m4_human_state.setFont(common_font)
-                self.lbl_m4_human_state.setFixedSize(150, 44)
-                self.lbl_m4_human_state.setWordWrap(True)
-                self.lbl_m4_human_state.setAlignment(QtCore.Qt.AlignCenter)
-                left_vbox_m4.addWidget(self.lbl_m4_human_state, alignment=QtCore.Qt.AlignLeft)
-                ####################
-
-                left_wrapper_m4 = QtWidgets.QWidget()
-                left_wrapper_m4.setLayout(left_vbox_m4)
-                left_wrapper_m4.setFixedWidth(150)
-                left_wrapper_m4.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
-
-                # right column for mission4 robot status
-                robot_vbox_m4 = QtWidgets.QVBoxLayout()
-                robot_vbox_m4.setContentsMargins(0,0,0,0)
-                robot_vbox_m4.setSpacing(6)
-                robot_vbox_m4.setAlignment(QtCore.Qt.AlignTop)
-
-                self.btn_m4_ok = QtWidgets.QPushButton("OK")
-                self.btn_m4_ok.setFixedSize(150, 44)
-                self.btn_m4_ok.setFont(common_font)
-                self.btn_m4_ok.setStyleSheet(self.robot_idle_style)
-                self.btn_m4_ok.clicked.connect(self.reset_robot_ok_flag)
-                robot_vbox_m4.addWidget(self.btn_m4_ok, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
-
-                self.btn_m4_pick = QtWidgets.QPushButton("Pick")
-                self.btn_m4_pick.setFixedSize(150, 44)
-                self.btn_m4_pick.setFont(common_font)
-                self.btn_m4_pick.setStyleSheet(self.robot_idle_style)
-                self.btn_m4_pick.clicked.connect(self.reset_robot_pick_flag)
-                robot_vbox_m4.addWidget(self.btn_m4_pick, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
-
-                right_wrapper_m4 = QtWidgets.QWidget()
-                right_wrapper_m4.setLayout(robot_vbox_m4)
-                right_wrapper_m4.setFixedWidth(150)
-                right_wrapper_m4.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Minimum)
-
-                # Put left and right wrappers into an HBox
-                h_inner_m4 = QtWidgets.QHBoxLayout()
-                h_inner_m4.setContentsMargins(0,0,0,0)
-                h_inner_m4.setSpacing(12)
-                h_inner_m4.addWidget(left_wrapper_m4, 0, QtCore.Qt.AlignTop)    # 수정
-                h_inner_m4.addWidget(right_wrapper_m4, 0, QtCore.Qt.AlignTop)
-
-                container_m4 = QtWidgets.QWidget()
-                container_m4.setLayout(h_inner_m4)
-                # container_m4.setFixedWidth(150 + 12 + 150)
-                container_m4.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Minimum)
-
-                l.addWidget(container_m4, alignment=QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
-
-            else:
-                placeholder = QtWidgets.QLabel("")
-                placeholder.setFixedSize(150, 48)
-                l.addWidget(placeholder)
-
-            pg.setLayout(l)
-            self.mission_stack.addWidget(pg)
-
-        # sync tabs <-> stack
-        self.tab_bar.currentChanged.connect(self.mission_stack.setCurrentIndex)
-        self.mission_stack.currentChanged.connect(self.tab_bar.setCurrentIndex)
-
-        # top layout: tabbar
-        top_h = QtWidgets.QHBoxLayout()
-        top_h.addWidget(self.tab_bar, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
-        top_h.addStretch()
-        right_layout.addLayout(top_h)
-
-        # mission_stack size increased so two columns fit and align with mission4
-        self.mission_stack.setFixedSize(336, 220)
-        right_layout.addWidget(self.mission_stack, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
-
-        right_layout.addStretch()
-
-        # log
+        
+        layout = QtWidgets.QVBoxLayout()
+        layout.addWidget(self.main_cam, stretch=1)
+        layout.addLayout(btn_layout)
+        
+        widget = QtWidgets.QWidget()
+        widget.setLayout(layout)
+        return widget
+    
+    def _create_right_panel(self) -> QtWidgets.QWidget:
+        """오른쪽 패널 생성"""
+        layout = QtWidgets.QVBoxLayout()
+        
+        # 탭바
+        self.tab_bar = self._create_tab_bar()
+        layout.addWidget(self.tab_bar, alignment=QtCore.Qt.AlignLeft)
+        
+        # 미션 스택
+        self.mission_stack = self._create_mission_stack()
+        layout.addWidget(self.mission_stack, alignment=QtCore.Qt.AlignLeft)
+        
+        layout.addStretch()
+        
+        # 로그
         self.log_list = QtWidgets.QListWidget()
         self.log_list.setMinimumWidth(300)
         self.log_list.setMaximumWidth(400)
-        log_container = QtWidgets.QWidget()
-        log_container_layout = QtWidgets.QVBoxLayout()
-        log_container_layout.addStretch()
-        log_container_layout.addWidget(self.log_list, alignment=QtCore.Qt.AlignBottom)
-        log_container.setLayout(log_container_layout)
-        right_layout.addWidget(log_container)
-
-        right_widget = QtWidgets.QWidget()
-        right_widget.setLayout(right_layout)
-        right_widget.setMinimumWidth(420)
-
-        main_layout = QtWidgets.QHBoxLayout()
-        main_layout.addWidget(left_widget, stretch=3)
-        main_layout.addWidget(right_widget, stretch=1)
-        central = QtWidgets.QWidget()
-        central.setLayout(main_layout)
-        self.setCentralWidget(central)
-
-        # internal
-        self.zmq_thread = None
-        self.ros_thread = None
-        self.zmq_endpoints = zmq_endpoints
-        self.ros_topics = ros_topics or DEFAULT_ROS_TOPICS
-
-        # detection flags (keep original names)
-        self.sos_flag = False
-        self.button_flag = False
-        self.fire_flag = False
-        self.door_flag = False
-        self.safebox_flag = False
-        self.human_flag = False
-        self.finish_flag = False
-
-        # robot flags (page-aware)
-        # self.robot_m3_ok_flag = False # 필요 없을듯
-        self.robot_m3_press_flag = False
-        self.robot_m3_open_flag = False
-
-        # self.robot_m4_ok_flag = False
-        self.robot_m4_pick_flag = False
-
-        self.robot_ok_flag = False
-        self.robot_press_flag = False
-        self.robot_open_flag = False
-        self.robot_pick_flag = False
-
-        # hookups
+        layout.addWidget(self.log_list)
+        
+        widget = QtWidgets.QWidget()
+        widget.setLayout(layout)
+        widget.setMinimumWidth(420)
+        return widget
+    
+    def _create_tab_bar(self) -> QtWidgets.QTabBar:
+        """탭바 생성"""
+        tab_bar = QtWidgets.QTabBar()
+        tab_bar.setExpanding(False)
+        tab_bar.setDrawBase(False)
+        tab_bar.setFixedHeight(34)
+        
+        for i in range(1, 5):
+            tab_bar.addTab(f"mission{i}")
+        
+        return tab_bar
+    
+    def _create_mission_stack(self) -> QtWidgets.QStackedWidget:
+        """미션 스택 생성"""
+        stack = QtWidgets.QStackedWidget()
+        stack.setFixedSize(336, 220)
+        
+        for mission_type in MissionType:
+            page = self._create_mission_page(mission_type)
+            stack.addWidget(page)
+        
+        return stack
+    
+    def _create_mission_page(self, mission_type: MissionType) -> QtWidgets.QWidget:
+        """미션 페이지 생성"""
+        page = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        if mission_type == MissionType.MISSION1:
+            # Mission 1: SOS만
+            widget = self._create_mission1_content()
+            layout.addWidget(widget, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+            
+        elif mission_type == MissionType.MISSION3:
+            # Mission 3: 감지 버튼들 + 로봇 상태
+            left_widget = self._create_mission3_detection_buttons()
+            right_widget = self._create_mission3_robot_buttons()
+            
+            h_layout = QtWidgets.QHBoxLayout()
+            h_layout.setSpacing(12)
+            h_layout.addWidget(left_widget, alignment=QtCore.Qt.AlignTop)
+            h_layout.addWidget(right_widget, alignment=QtCore.Qt.AlignTop)
+            
+            container = QtWidgets.QWidget()
+            container.setLayout(h_layout)
+            layout.addWidget(container, alignment=QtCore.Qt.AlignCenter | QtCore.Qt.AlignTop)
+            
+        elif mission_type == MissionType.MISSION4:
+            # Mission 4: 감지 버튼들 + 로봇 상태
+            left_widget = self._create_mission4_detection_buttons()
+            right_widget = self._create_mission4_robot_buttons()
+            
+            h_layout = QtWidgets.QHBoxLayout()
+            h_layout.setSpacing(12)
+            h_layout.addWidget(left_widget, alignment=QtCore.Qt.AlignTop)
+            h_layout.addWidget(right_widget, alignment=QtCore.Qt.AlignTop)
+            
+            container = QtWidgets.QWidget()
+            container.setLayout(h_layout)
+            layout.addWidget(container, alignment=QtCore.Qt.AlignCenter | QtCore.Qt.AlignTop)
+        
+        page.setLayout(layout)
+        return page
+    
+    def _create_button(self, text: str, button_type: str = 'detection') -> QtWidgets.QPushButton:
+        """공통 버튼 생성 함수"""
+        btn = QtWidgets.QPushButton(text)
+        btn.setFixedSize(150, 44)
+        
+        font = QtGui.QFont()
+        font.setPointSize(12)
+        font.setBold(True)
+        btn.setFont(font)
+        
+        if button_type == 'detection':
+            btn.setStyleSheet(UI_STYLES.DET_IDLE)
+        else:  # robot
+            btn.setStyleSheet(UI_STYLES.ROBOT_IDLE)
+        
+        return btn
+    
+    def _create_mission1_content(self) -> QtWidgets.QWidget:
+        """Mission 1 컨텐츠 생성"""
+        layout = QtWidgets.QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        
+        self.btn_m1_sos = self._create_button("SOS: NO")
+        self.btn_m1_sos.clicked.connect(lambda: self._reset_flag('sos_flag', self.btn_m1_sos, "SOS: NO"))
+        
+        layout.addWidget(self.btn_m1_sos, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        
+        widget = QtWidgets.QWidget()
+        widget.setLayout(layout)
+        widget.setFixedWidth(150)
+        return widget
+    
+    def _create_mission3_detection_buttons(self) -> QtWidgets.QWidget:
+        """Mission 3 감지 버튼들 생성"""
+        layout = QtWidgets.QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        
+        # 버튼들
+        self.btn_m3_button = self._create_button("BUTTON: NO")
+        self.btn_m3_fire = self._create_button("FIRE: NO")
+        self.btn_m3_door = self._create_button("DOOR: NO")
+        
+        # 이벤트 연결
+        self.btn_m3_button.clicked.connect(lambda: self._reset_flag('button_flag', self.btn_m3_button, "BUTTON: NO"))
+        self.btn_m3_fire.clicked.connect(self._reset_fire_flag)
+        self.btn_m3_door.clicked.connect(lambda: self._reset_flag('door_flag', self.btn_m3_door, "DOOR: NO"))
+        
+        layout.addWidget(self.btn_m3_button, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        layout.addWidget(self.btn_m3_fire, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        layout.addWidget(self.btn_m3_door, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        
+        # 불 카운터 레이블
+        self.lbl_m3_fire_count = QtWidgets.QLabel("불의 개수: 0 개 (0/3)")
+        font = QtGui.QFont()
+        font.setPointSize(12)
+        font.setBold(True)
+        self.lbl_m3_fire_count.setFont(font)
+        self.lbl_m3_fire_count.setFixedSize(150, 44)
+        self.lbl_m3_fire_count.setWordWrap(True)
+        self.lbl_m3_fire_count.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(self.lbl_m3_fire_count, alignment=QtCore.Qt.AlignLeft)
+        
+        widget = QtWidgets.QWidget()
+        widget.setLayout(layout)
+        widget.setFixedWidth(150)
+        return widget
+    
+    def _create_mission3_robot_buttons(self) -> QtWidgets.QWidget:
+        """Mission 3 로봇 버튼들 생성"""
+        layout = QtWidgets.QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        
+        self.btn_m3_ok_1 = self._create_button("OK", 'robot')
+        self.btn_m3_ok_2 = self._create_button("OK", 'robot')
+        self.btn_m3_open = self._create_button("Open", 'robot')
+        
+        # 이벤트 연결
+        self.btn_m3_ok_1.clicked.connect(lambda: self._reset_robot_flag('robot_ok_flag', [self.btn_m3_ok_1, getattr(self, 'btn_m4_ok', None)]))
+        self.btn_m3_ok_2.clicked.connect(lambda: self._reset_robot_flag('robot_ok_flag', [self.btn_m3_ok_2]))
+        self.btn_m3_open.clicked.connect(lambda: self._reset_robot_flag('robot_open_flag', [self.btn_m3_open]))
+        
+        layout.addWidget(self.btn_m3_ok_1, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        layout.addWidget(self.btn_m3_ok_2, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        layout.addWidget(self.btn_m3_open, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        
+        widget = QtWidgets.QWidget()
+        widget.setLayout(layout)
+        widget.setFixedWidth(150)
+        return widget
+    
+    def _create_mission4_detection_buttons(self) -> QtWidgets.QWidget:
+        """Mission 4 감지 버튼들 생성"""
+        layout = QtWidgets.QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(45)
+        
+        # 버튼들
+        self.btn_m4_safebox = self._create_button("SAFEBOX: NO")
+        self.btn_m4_human = self._create_button("HUMAN: NO")
+        self.btn_m4_finish = self._create_button("FINISH: NO")
+        
+        # 이벤트 연결
+        self.btn_m4_safebox.clicked.connect(lambda: self._reset_flag('safebox_flag', self.btn_m4_safebox, "SAFEBOX: NO"))
+        self.btn_m4_human.clicked.connect(self._reset_human_flag)
+        self.btn_m4_finish.clicked.connect(lambda: self._reset_flag('finish_flag', self.btn_m4_finish, "FINISH: NO"))
+        
+        layout.addWidget(self.btn_m4_safebox, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        layout.addWidget(self.btn_m4_human, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        layout.addWidget(self.btn_m4_finish, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        
+        # 사람 카운터 레이블들
+        font = QtGui.QFont()
+        font.setPointSize(12)
+        font.setBold(True)
+        
+        self.lbl_m4_human_count = QtWidgets.QLabel("사람: 0 명 (0/3)")
+        self.lbl_m4_human_count.setFont(font)
+        self.lbl_m4_human_count.setFixedSize(150, 44)
+        self.lbl_m4_human_count.setWordWrap(True)
+        self.lbl_m4_human_count.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(self.lbl_m4_human_count, alignment=QtCore.Qt.AlignLeft)
+        
+        self.lbl_m4_human_state = QtWidgets.QLabel("상태: 생존 / 사망")
+        self.lbl_m4_human_state.setFont(font)
+        self.lbl_m4_human_state.setFixedSize(150, 44)
+        self.lbl_m4_human_state.setWordWrap(True)
+        self.lbl_m4_human_state.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(self.lbl_m4_human_state, alignment=QtCore.Qt.AlignLeft)
+        
+        widget = QtWidgets.QWidget()
+        widget.setLayout(layout)
+        widget.setFixedWidth(150)
+        return widget
+    
+    def _create_mission4_robot_buttons(self) -> QtWidgets.QWidget:
+        """Mission 4 로봇 버튼들 생성"""
+        layout = QtWidgets.QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        
+        self.btn_m4_ok = self._create_button("OK", 'robot')
+        self.btn_m4_pick = self._create_button("Pick", 'robot')
+        
+        # 이벤트 연결
+        self.btn_m4_ok.clicked.connect(lambda: self._reset_robot_flag('robot_ok_flag', [getattr(self, 'btn_m3_ok_1', None), self.btn_m4_ok]))
+        self.btn_m4_pick.clicked.connect(lambda: self._reset_robot_flag('robot_pick_flag', [self.btn_m4_pick]))
+        
+        layout.addWidget(self.btn_m4_ok, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        layout.addWidget(self.btn_m4_pick, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        
+        widget = QtWidgets.QWidget()
+        widget.setLayout(layout)
+        widget.setFixedWidth(150)
+        return widget
+    
+    def _connect_signals(self):
+        """시그널 연결"""
+        # 컨트롤 버튼들
         self.start_btn.clicked.connect(self.start_stream)
         self.stop_btn.clicked.connect(self.stop_stream)
-        self._left_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Left), self)
-        self._right_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Right), self)
-        self._left_shortcut.activated.connect(self.go_prev_tab)
-        self._right_shortcut.activated.connect(self.go_next_tab)
-
-        QtCore.QCoreApplication.instance().aboutToQuit.connect(self.on_app_quit)
-
-    # -----------------------------
-    # ZMQ / ROS control
-    # -----------------------------
+        
+        # 탭 동기화
+        self.tab_bar.currentChanged.connect(self.mission_stack.setCurrentIndex)
+        self.mission_stack.currentChanged.connect(self.tab_bar.setCurrentIndex)
+        
+        # 키보드 단축키
+        self._setup_shortcuts()
+    
+    def _setup_shortcuts(self):
+        """키보드 단축키 설정"""
+        left_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Left), self)
+        right_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Right), self)
+        
+        left_shortcut.activated.connect(self._go_prev_tab)
+        right_shortcut.activated.connect(self._go_next_tab)
+    
+    # ---------------------------
+    # 이벤트 핸들러들 (최적화)
+    # ---------------------------
+    def _reset_flag(self, flag_name: str, button: QtWidgets.QPushButton, idle_text: str):
+        """공통 플래그 리셋 함수"""
+        self.state.set_flag(flag_name, False)
+        button.setText(idle_text)
+        button.setStyleSheet(UI_STYLES.DET_IDLE)
+        self._append_log(f"[UI] {flag_name} reset")
+    
+    def _reset_robot_flag(self, flag_name: str, buttons: List[QtWidgets.QPushButton]):
+        """로봇 플래그 리셋 함수"""
+        self.state.set_flag(flag_name, False)
+        for btn in buttons:
+            if btn is not None:
+                btn.setStyleSheet(UI_STYLES.ROBOT_IDLE)
+        self._append_log(f"[UI] {flag_name} reset")
+    
+    def _reset_fire_flag(self):
+        """불 플래그 특별 리셋"""
+        self.state.set_flag('fire_flag', False)
+        self.state.reset_counter('fire_count')
+        self.btn_m3_fire.setText("FIRE: NO")
+        self.btn_m3_fire.setStyleSheet(UI_STYLES.DET_IDLE)
+        self.lbl_m3_fire_count.setText("불의 개수: 0 개 (0/3)")
+        self._append_log("[UI] Fire flag and counter reset")
+    
+    def _reset_human_flag(self):
+        """사람 플래그 특별 리셋"""
+        self.state.set_flag('human_flag', False)
+        self.state.reset_counter('human_count')
+        self.btn_m4_human.setText("HUMAN: NO")
+        self.btn_m4_human.setStyleSheet(UI_STYLES.DET_IDLE)
+        self.lbl_m4_human_count.setText("사람: 0 명 (0/3)")
+        self._append_log("[UI] Human flag and counter reset")
+    
+    def _go_next_tab(self):
+        """다음 탭으로"""
+        current = self.tab_bar.currentIndex()
+        count = self.tab_bar.count()
+        next_idx = (current + 1) % count
+        self.tab_bar.setCurrentIndex(next_idx)
+        self._append_log(f"[UI] Mission -> {next_idx + 1}")
+    
+    def _go_prev_tab(self):
+        """이전 탭으로"""
+        current = self.tab_bar.currentIndex()
+        count = self.tab_bar.count()
+        prev_idx = (current - 1) % count
+        self.tab_bar.setCurrentIndex(prev_idx)
+        self._append_log(f"[UI] Mission -> {prev_idx + 1}")
+    
+    @QtCore.Slot(str)
+    def _append_log(self, message: str):
+        """로그 추가 (스레드 안전)"""
+        try:
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            if self.log_list is not None:
+                self.log_list.addItem(f"{timestamp} {message}")
+                self.log_list.scrollToBottom()
+            else:
+                print(f"{timestamp} {message}")
+        except Exception as e:
+            print(f"[UI] Log error: {e}")
+    
+    # -------------------------------------------------------------
+    # ROS2 콜백 함수들, flag를 설정 
+    # -------------------------------------------------------------
+     ################### mission1의 sos 인식 #######################
     @QtCore.Slot()
-    def on_sos_detected(self):
-        """SOS 감지 토픽을 받았을 때"""
-        if not self.sos_flag:
-            self.sos_flag = True
+    def _on_sos_detected(self):
+        """SOS 감지"""
+        if not self.state.get_flag('sos_flag'):
+            self.state.set_flag('sos_flag', True)
             self.btn_m1_sos.setText("SOS: YES")
-            self.btn_m1_sos.setStyleSheet(self.det_active_style)
-            self.append_log("[ROS2] SOS detected!")
-
-    # Mission3 콜백들
-    @QtCore.Slot()
-    def on_button_detected(self):
-        if not self.button_flag:
-            self.button_flag = True
+            self.btn_m1_sos.setStyleSheet(UI_STYLES.DET_ACTIVE)
+            self._append_log("[ROS2] SOS detected!")
+    
+    ################# mission3의 버튼, 불, 문 인식 ##################
+    @QtCore.Slot() 
+    def _on_button_detected(self):
+        """버튼 감지"""
+        if not self.state.get_flag('button_flag'):
+            self.state.set_flag('button_flag', True)
             self.btn_m3_button.setText("BUTTON: YES")
-            self.btn_m3_button.setStyleSheet(self.det_active_style)
-            self.append_log("[ROS2] Button detected!")
-
+            self.btn_m3_button.setStyleSheet(UI_STYLES.DET_ACTIVE)
+            self._append_log("[ROS2] Button detected!")
+    
     @QtCore.Slot()
-    def on_fire_detected(self):
-        self.fire_count += 1
-        if hasattr(self, 'lbl_m3_fire_count'):
-            self.lbl_m3_fire_count.setText(f"불의 개수: {self.fire_count} 개 ({self.fire_count}/3)")
+    def _on_fire_detected(self):
+        """불 감지"""
+        count = self.state.increment_counter('fire_count')
+        self.lbl_m3_fire_count.setText(f"불의 개수: {count} 개 ({count}/3)")
         
-        if not self.fire_flag:
-            self.fire_flag = True
+        if not self.state.get_flag('fire_flag'):
+            self.state.set_flag('fire_flag', True)
             self.btn_m3_fire.setText("FIRE: YES")
-            self.btn_m3_fire.setStyleSheet(self.det_active_style)
-            self.append_log("[ROS2] Fire detected!")
-
+            self.btn_m3_fire.setStyleSheet(UI_STYLES.DET_ACTIVE)
+            self._append_log("[ROS2] Fire detected!")
+    
     @QtCore.Slot()
-    def on_door_detected(self):
-        if not self.door_flag:
-            self.door_flag = True
+    def _on_door_detected(self):
+        """문 감지"""
+        if not self.state.get_flag('door_flag'):
+            self.state.set_flag('door_flag', True)
             self.btn_m3_door.setText("DOOR: YES")
-            self.btn_m3_door.setStyleSheet(self.det_active_style)
-            self.append_log("[ROS2] Door detected!")
-
+            self.btn_m3_door.setStyleSheet(UI_STYLES.DET_ACTIVE)
+            self._append_log("[ROS2] Door detected!")
+    
+    ############ mission4의 보급상자, 사람, finish 라인 인식 ###########
     @QtCore.Slot()
-    def on_robot_ok(self):
-        if not self.robot_ok_flag:
-            self.robot_ok_flag = True
-            if hasattr(self, 'btn_m3_ok'):
-                self.btn_m3_ok.setStyleSheet(self.robot_active_style)
-            if hasattr(self, 'btn_m4_ok'):
-                self.btn_m4_ok.setStyleSheet(self.robot_active_style)
-            self.append_log("[ROS2] Robot OK!")
-
-    @QtCore.Slot()
-    def on_robot_press(self):
-        if not self.robot_press_flag:
-            self.robot_press_flag = True
-            self.btn_m3_press.setStyleSheet(self.robot_active_style)
-            self.append_log("[ROS2] Robot Press!")
-
-    @QtCore.Slot()
-    def on_robot_open(self):
-        if not self.robot_open_flag:
-            self.robot_open_flag = True
-            self.btn_m3_open.setStyleSheet(self.robot_active_style)
-            self.append_log("[ROS2] Robot Open!")
-
-    # Mission4 콜백들
-    @QtCore.Slot()
-    def on_safebox_detected(self):
-        if not self.safebox_flag:
-            self.safebox_flag = True
+    def _on_safebox_detected(self):
+        """보급상자"""
+        if not self.state.get_flag('safebox_flag'):
+            self.state.set_flag('safebox_flag', True)
             self.btn_m4_safebox.setText("SAFEBOX: YES")
-            self.btn_m4_safebox.setStyleSheet(self.det_active_style)
-            self.append_log("[ROS2] Safebox detected!")
-
+            self.btn_m4_safebox.setStyleSheet(UI_STYLES.DET_ACTIVE)
+            self._append_log("[ROS2] Safebox detected!")
+    
     @QtCore.Slot()
-    def on_human_detected(self):
-        self.human_count += 1
-        if hasattr(self, 'lbl_m4_human_count'):
-            self.lbl_m4_human_count.setText(f"사람: {self.human_count} 명 ({self.human_count}/3)")
+    def _on_human_detected(self):
+        """사람 감지"""
+        count = self.state.increment_counter('human_count')
+        self.lbl_m4_human_count.setText(f"사람: {count} 명 ({count}/3)")
         
-        if not self.human_flag:
-            self.human_flag = True
+        if not self.state.get_flag('human_flag'):
+            self.state.set_flag('human_flag', True)
             self.btn_m4_human.setText("HUMAN: YES")
-            self.btn_m4_human.setStyleSheet(self.det_active_style)
-            self.append_log("[ROS2] Human detected!")
-
+            self.btn_m4_human.setStyleSheet(UI_STYLES.DET_ACTIVE)
+            self._append_log("[ROS2] Human detected!")
+    
     @QtCore.Slot()
-    def on_finish_detected(self):
-        if not self.finish_flag:
-            self.finish_flag = True
+    def _on_finish_detected(self):
+        """완료 감지"""
+        if not self.state.get_flag('finish_flag'):
+            self.state.set_flag('finish_flag', True)
             self.btn_m4_finish.setText("FINISH: YES")
-            self.btn_m4_finish.setStyleSheet(self.det_active_style)
-            self.append_log("[ROS2] Finish detected!")
-
+            self.btn_m4_finish.setStyleSheet(UI_STYLES.DET_ACTIVE)
+            self._append_log("[ROS2] Finish detected!")
+    
+    ############# 버튼 인식, 보급 상자 인식이 되면 터미널에 로그를 출력 ############
     @QtCore.Slot()
-    def on_robot_pick(self):
-        if not self.robot_pick_flag:
-            self.robot_pick_flag = True
-            self.btn_m4_pick.setStyleSheet(self.robot_active_style)
-            self.append_log("[ROS2] Robot Pick!")
+    def _on_robot_ok(self):
+        """로봇 OK"""
+        if not self.state.get_flag('robot_ok_flag'):
+            self.state.set_flag('robot_ok_flag', True)
+            if hasattr(self, 'btn_m3_ok_1'):
+                self.btn_m3_ok_1.setStyleSheet(UI_STYLES.ROBOT_ACTIVE)
+            if hasattr(self, 'btn_m3_ok_2'):
+                self.btn_m3_ok_2.setStyleSheet(UI_STYLES.ROBOT_ACTIVE)
+            if hasattr(self, 'btn_m4_ok'):
+                self.btn_m4_ok.setStyleSheet(UI_STYLES.ROBOT_ACTIVE)
+            self._append_log("[ROS2] Robot OK!")
+ 
+    @QtCore.Slot()
+    def _on_robot_open(self):
+        """로봇 Open"""
+        if not self.state.get_flag('robot_open_flag'):
+            self.state.set_flag('robot_open_flag', True)
+            self.btn_m3_open.setStyleSheet(UI_STYLES.ROBOT_ACTIVE)
+            self._append_log("[ROS2] Robot Open!")
+    
+    @QtCore.Slot()
+    def _on_robot_pick(self):
+        """로봇 Pick"""
+        if not self.state.get_flag('robot_pick_flag'):
+            self.state.set_flag('robot_pick_flag', True)
+            self.btn_m4_pick.setStyleSheet(UI_STYLES.ROBOT_ACTIVE)
+            self._append_log("[ROS2] Robot Pick!")
     
     @QtCore.Slot(object)
-    def on_frame_received(self, data):
-        # data: (topic, frame_ndarray)
+    def _on_frame_received(self, data):
+        """프레임 수신"""
         try:
             _, frame = data
             self.main_cam.show_frame(frame)
         except Exception as e:
-            self.append_log(f"[UI] frame handler err: {e}")
-
-    @QtCore.Slot(str)
-    def on_zmq_detection(self, canonical):
-        # 'sos_detected', 'button_detected', ...
-        if canonical == "sos_detected":
-            self.on_sos_detected()
-        elif canonical == "button_detected":
-            self.on_button_detected()
-        elif canonical == "fire_detected":
-            self.on_fire_detected()
-        elif canonical == "door_detected":
-            self.on_door_detected()
-        elif canonical == "safebox_detected":
-            self.on_safebox_detected()
-        elif canonical == "human_detected":
-            self.on_human_detected()
-        elif canonical == "finish_detected":
-            self.on_finish_detected()
-
-    # MainWindow 클래스 내부 어딘가(예: reset_* 함수들 위/아래)에 추가
-    @QtCore.Slot(str)
-    def append_log(self, s: str):
-        try:
-            ts = datetime.now().strftime("%H:%M:%S")
-            if hasattr(self, "log_list") and self.log_list is not None:
-                self.log_list.addItem(f"{ts} {s}")
-                self.log_list.scrollToBottom()
-            else:
-                # 혹시 log_list가 아직 없거나 None이면 콘솔로라도 출력
-                print(f"{ts} {s}")
-        except Exception as e:
-            print(f"[UI] append_log error: {e}")
-
-    # 리셋 함수들
-    def reset_sos_flag(self):
-        self.sos_flag = False
-        self.btn_m1_sos.setText("SOS: NO")
-        self.btn_m1_sos.setStyleSheet(self.det_idle_style)
-        self.append_log("[UI] SOS flag reset")
-
-    # Mission3 리셋 함수들
-    def reset_button_flag(self):
-        self.button_flag = False
-        self.btn_m3_button.setText("BUTTON: NO")
-        self.btn_m3_button.setStyleSheet(self.det_idle_style)
-        self.append_log("[UI] Button flag reset")
-
-    def reset_fire_flag(self):
-        self.fire_flag = False
-        self.fire_count = 0
-        self.btn_m3_fire.setText("FIRE: NO")
-        self.btn_m3_fire.setStyleSheet(self.det_idle_style)
-        if hasattr(self, 'lbl_m3_fire_count'):
-            self.lbl_m3_fire_count.setText("불의 개수: 0 개 (0/3)")
-        self.append_log("[UI] Fire flag reset")
-
-    def reset_door_flag(self):
-        self.door_flag = False
-        self.btn_m3_door.setText("DOOR: NO")
-        self.btn_m3_door.setStyleSheet(self.det_idle_style)
-        self.append_log("[UI] Door flag reset")
-
-    def reset_robot_ok_flag(self):
-        self.robot_ok_flag = False
-        if hasattr(self, 'btn_m3_ok'):
-            self.btn_m3_ok.setStyleSheet(self.robot_idle_style)
-        if hasattr(self, 'btn_m4_ok'):
-            self.btn_m4_ok.setStyleSheet(self.robot_idle_style)
-        self.append_log("[UI] Robot OK flag reset")
-
-    def reset_robot_press_flag(self):
-        self.robot_press_flag = False
-        self.btn_m3_press.setStyleSheet(self.robot_idle_style)
-        self.append_log("[UI] Robot Press flag reset")
-
-    def reset_robot_open_flag(self):
-        self.robot_open_flag = False
-        self.btn_m3_open.setStyleSheet(self.robot_idle_style)
-        self.append_log("[UI] Robot Open flag reset")
-
-    # Mission4 리셋 함수들
-    def reset_safebox_flag(self):
-        self.safebox_flag = False
-        self.btn_m4_safebox.setText("SAFEBOX: NO")
-        self.btn_m4_safebox.setStyleSheet(self.det_idle_style)
-        self.append_log("[UI] Safebox flag reset")
-
-    def reset_human_flag(self):
-        self.human_flag = False
-        self.human_count = 0
-        self.btn_m4_human.setText("HUMAN: NO")
-        self.btn_m4_human.setStyleSheet(self.det_idle_style)
-        if hasattr(self, 'lbl_m4_human_count'):
-            self.lbl_m4_human_count.setText("사람: 0 명 (0/3)")
-        self.append_log("[UI] Human flag reset")
-
-    def reset_finish_flag(self):
-        self.finish_flag = False
-        self.btn_m4_finish.setText("FINISH: NO")
-        self.btn_m4_finish.setStyleSheet(self.det_idle_style)
-        self.append_log("[UI] Finish flag reset")
-
-    def reset_robot_pick_flag(self):
-        self.robot_pick_flag = False
-        self.btn_m4_pick.setStyleSheet(self.robot_idle_style)
-        self.append_log("[UI] Robot Pick flag reset")
-
-    # tabs
-    def go_next_tab(self):
-        idx = self.tab_bar.currentIndex()
-        cnt = self.tab_bar.count()
-        self.tab_bar.setCurrentIndex((idx + 1) % cnt)
-        self.append_log(f"[UI] mission -> {self.tab_bar.currentIndex()+1}")
-
-    def go_prev_tab(self):
-        idx = self.tab_bar.currentIndex()
-        cnt = self.tab_bar.count()
-        self.tab_bar.setCurrentIndex((idx - 1) % cnt)
-        self.append_log(f"[UI] mission -> {self.tab_bar.currentIndex()+1}")
-
-    # ZQM는 프레임만 -> frame_received만 연결 
-    # ROS2는 모든 탐지/상태 -> 각 시그널을 기존 슬롯에 연결
+            self._append_log(f"[UI] Frame handler error: {e}")
+    
+    # ------------------------------------------------------------
+    # 스트림 제어
+    # ------------------------------------------------------------
     def start_stream(self):
-        # 이미 실행 중이면 무시
-        if (self.zmq_thread is not None and self.zmq_thread.isRunning()) or \
-        (self.ros_thread is not None and self.ros_thread.isRunning()):
-            self.append_log("[UI] Already running.")
+        """스트림 시작"""
+        if self._is_running():
+            self._append_log("[UI] Already running.")
             return
-
-        # --- ZMQ (영상 전용) ---
+        
+        # ZMQ 스레드 시작
+        self._start_zmq_thread()
+        
+        # ROS2 스레드 시작
+        self._start_ros_thread()
+    
+    def stop_stream(self):
+        """스트림 중지"""
+        self._stop_threads()
+    
+    def _is_running(self) -> bool:
+        """실행 중인지 확인"""
+        zmq_running = self.zmq_thread and self.zmq_thread.isRunning()
+        ros_running = self.ros_thread and self.ros_thread.isRunning()
+        return zmq_running or ros_running
+    
+    def _start_zmq_thread(self):
+        """ZMQ 스레드 시작"""
         try:
-            self.zmq_thread = ZmqSubscriberThread(
-                endpoints=self.zmq_endpoints,
-            )
-            self.zmq_thread.text_received.connect(self.append_log)
-            self.zmq_thread.frame_received.connect(self.on_frame_received)
+            self.zmq_thread = ZmqSubscriberThread(self.zmq_endpoints)
+            self.zmq_thread.text_received.connect(self._append_log)
+            self.zmq_thread.frame_received.connect(self._on_frame_received)
             self.zmq_thread.start()
-            self.append_log("[ZMQ] image subscriber started.")
+            self._append_log("[ZMQ] Image subscriber started")
         except Exception as e:
-            self.append_log(f"[ZMQ] start error: {e}")
-
-        # --- ROS2 (탐지/상태 전부) ---
+            self._append_log(f"[ZMQ] Start error: {e}")
+    
+    def _start_ros_thread(self):
+        """ROS2 스레드 시작"""
         try:
             self.ros_thread = Ros2SubscriberThread()
-            self.ros_thread.text_received.connect(self.append_log)
-
-            # 탐지
-            self.ros_thread.sos_detected.connect(self.on_sos_detected)
-            self.ros_thread.button_detected.connect(self.on_button_detected)
-            self.ros_thread.fire_detected.connect(self.on_fire_detected)
-            self.ros_thread.door_detected.connect(self.on_door_detected)
-            self.ros_thread.safebox_detected.connect(self.on_safebox_detected)
-            self.ros_thread.human_detected.connect(self.on_human_detected)
-            self.ros_thread.finish_detected.connect(self.on_finish_detected)
-
-            # 로봇 상태
-            self.ros_thread.robot_ok.connect(self.on_robot_ok)
-            self.ros_thread.robot_press.connect(self.on_robot_press)
-            self.ros_thread.robot_open.connect(self.on_robot_open)
-            self.ros_thread.robot_pick.connect(self.on_robot_pick)
-
+            self.ros_thread.text_received.connect(self._append_log)
+            
+            # 탐지 시그널 연결
+            self.ros_thread.sos_detected.connect(self._on_sos_detected)
+            self.ros_thread.button_detected.connect(self._on_button_detected)
+            self.ros_thread.fire_detected.connect(self._on_fire_detected)
+            self.ros_thread.door_detected.connect(self._on_door_detected)
+            self.ros_thread.safebox_detected.connect(self._on_safebox_detected)
+            self.ros_thread.human_detected.connect(self._on_human_detected)
+            self.ros_thread.finish_detected.connect(self._on_finish_detected)
+            
+            # 로봇 상태 시그널 연결
+            self.ros_thread.robot_ok.connect(self._on_robot_ok)
+            self.ros_thread.robot_open.connect(self._on_robot_open)
+            self.ros_thread.robot_pick.connect(self._on_robot_pick)
+            
             self.ros_thread.start()
-            self.append_log("[ROS2] all-topic subscriber started.")
+            self._append_log("[ROS2] All-topic subscriber started")
         except Exception as e:
-            self.append_log(f"[ROS2] start error: {e}")
-
-    def stop_stream(self):
-        # ZMQ stop
-        if self.zmq_thread is not None and self.zmq_thread.isRunning():
+            self._append_log(f"[ROS2] Start error: {e}")
+    
+    def _stop_threads(self):
+        """모든 스레드 중지"""
+        if self.zmq_thread and self.zmq_thread.isRunning():
             self.zmq_thread.stop()
             self.zmq_thread.wait(1000)
-            self.append_log("[ZMQ] stopped.")
-        # ROS stop
-        if self.ros_thread is not None and self.ros_thread.isRunning():
+            self._append_log("[ZMQ] Stopped")
+        
+        if self.ros_thread and self.ros_thread.isRunning():
             self.ros_thread.stop()
             self.ros_thread.wait(1000)
-            self.append_log("[ROS2] stopped.")
-
-    def on_app_quit(self):
-        # ensure threads stopped (앱 종료 시 안전하게 stop 요청)
-        if self.zmq_thread is not None and self.zmq_thread.isRunning():
-            self.zmq_thread.stop()
-            self.zmq_thread.wait(1000)
-        if self.ros_thread is not None and self.ros_thread.isRunning():
-            self.ros_thread.stop()
-            self.ros_thread.wait(1000)
+            self._append_log("[ROS2] Stopped")
+    
+    def _cleanup(self):
+        """리소스 정리"""
+        self._stop_threads()
 
 # ---------------------------
-# Entry point
+# main
 # ---------------------------
 def main():
+    """메인 함수"""
+    # 기본 엔드포인트 설정
     endpoints = [
-        "tcp://127.0.0.1:5555",  # image
-        "tcp://127.0.0.1:5556",  # safebox detection
-        "tcp://127.0.0.1:5558",  # human detection
-        "tcp://127.0.0.1:5559",  # finish detection
+        "tcp://127.0.0.1:5555",  # 메인 카메라
+        # "tcp://127.0.0.1:5556",  # 보급상자 감지
+        # "tcp://127.0.0.1:5558",  # 사람 감지
+        # "tcp://127.0.0.1:5559",  # 완료 감지
     ]
-
+    
     app = QtWidgets.QApplication(sys.argv)
-    win = MainWindow(endpoints)
-    win.show()
-    sys.exit(app.exec())
-
+    window = MainWindow(endpoints)
+    window.show()
+    
+    try:
+        sys.exit(app.exec())
+    except KeyboardInterrupt:
+        print("\nApplication interrupted by user")
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()
