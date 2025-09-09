@@ -15,14 +15,18 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("ZMQ + ROS2 Viewer (Optimized)")
         self.resize(1000, 700)
-        self.state = StateManager()                     # 상태 관리자
+        self.state          = StateManager()            # 상태 관리자
         self.zmq_endpoints = zmq_endpoints              # 설정
         self.ros_topics = ros_topics or DEFAULT_ROS_TOPICS
-        self.zmq_thread = None
-        self.ros_thread = None
+        self.zmq_thread     = None
+        self.ros_thread     = None
         self._init_ui()                                 # UI 초기화
         self._connect_signals()
         self._frame_pending = False
+        self._fire_on       = 0
+        self._fire_off      = 0
+        self._human_red     = 0
+        self._human_blue    = 0
         
         # 종료 시 정리
         QtCore.QCoreApplication.instance().aboutToQuit.connect(self._cleanup)
@@ -222,39 +226,11 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.btn_m3_button_ok, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
         layout.addWidget(self.btn_m3_fire_done, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
         layout.addWidget(self.btn_m3_open,      alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
-   
+
         widget = QtWidgets.QWidget()
         widget.setLayout(layout)
         widget.setFixedWidth(150)
         return widget
-    
-    # def _create_mission4_detection_buttons(self) -> QtWidgets.QWidget:
-    #     """Mission 4 감지 버튼들 생성"""
-    #     layout = QtWidgets.QVBoxLayout()
-    #     layout.setContentsMargins(0, 0, 0, 0)
-    #     layout.setSpacing(6)
-        
-    #     # 버튼들
-    #     self.btn_m4_safebox     = self._create_button("SAFEBOX: NO")
-    #     self.btn_m4_safebox2    = self._create_button("SAFEBOX_2: NO")
-    #     self.btn_m4_human       = self._create_button("HUMAN: (0/3)")
-    #     self.btn_m4_finish      = self._create_button("FINISH: NO")
-        
-    #     # 이벤트 연결
-    #     self.btn_m4_safebox.clicked.connect(lambda: self._reset_flag('safebox_flag', self.btn_m4_safebox, 
-    #                                                                  "SAFEBOX: NO", getattr(self, 'btn_m4_pick_place', None),
-    #                                                                  'robot_pick_place_flag'))
-    #     self.btn_m4_safebox2.clicked.connect(lambda: self._reset_flag('safebox2_flag', self.btn_m4_safebox2, 
-    #                                                                  "SAFEBOX_2: NO", getattr(self, 'btn_m4_pick_place', None),
-    #                                                                  'robot_pick_place_flag'))
-    #     self.btn_m4_human.clicked.connect(self._reset_human_flag)
-    #     self.btn_m4_finish.clicked.connect(lambda: self._reset_flag('finish_flag', self.btn_m4_finish, "FINISH: NO"))
-    #     # 
-    #     for b in (self.btn_m4_safebox, self.btn_m4_safebox2, self.btn_m4_human, self.btn_m4_finish):
-    #         layout.addWidget(b, alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
-
-    #     w = QtWidgets.QWidget(); w.setLayout(layout); w.setFixedWidth(150)
-    #     return w 
     
     def _create_mission4_robot_buttons(self) -> QtWidgets.QWidget:
         """Mission 4 로봇 버튼들 생성"""
@@ -382,21 +358,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self.state.reset_counter('fire_count')
         self.btn_m3_fire.setText("FIRE: (0/4)")
         self.btn_m3_fire.setStyleSheet(UI_STYLES.DET_IDLE)
-        # fire 완료 로봇 박스도 함께 리셋할지 
+
+        # on/off 카운터 초기화
+        self._fire_on = 0
+        self._fire_off = 0
+
         self.state.set_flag('robot_fire_done_flag', False)
-        self.btn_m3_fire_done.setStyleSheet(UI_STYLES.ROBOT_IDLE)
+        if hasattr(self, 'btn_m3_fire_done'):
+            self.btn_m3_fire_done.setStyleSheet(UI_STYLES.ROBOT_IDLE)
         self._append_log("[UI] Fire flag and counter reset")
     
     def _reset_human_flag(self):
         """mission4 사람 플래그 특별 리셋"""
         self.state.set_flag('human_flag', False)
-        self.state.reset_counter('human_count')
         self.btn_m4_human.setText("HUMAN: (0/3)")
         self.btn_m4_human.setStyleSheet(UI_STYLES.DET_IDLE)
+
+        self._human_red = 0
+        self._human_blue = 0
+
         self.state.set_flag('robot_human_done_flag', False)
         if hasattr(self, 'btn_m4_human_end'):
             self.btn_m4_human_end.setStyleSheet(UI_STYLES.ROBOT_IDLE)
-        # self.lbl_m4_human_count.setText("사람: 0 명 (0/3)")
         self._append_log("[UI] Human reset")
     
     def _go_next_tab(self):
@@ -482,27 +465,39 @@ class MainWindow(QtWidgets.QMainWindow):
             self._append_log("[ROS2] 버튼 인식 완료! Button detected!")
     
     @QtCore.Slot()
-    def _on_fire_detected(self):
-        """불 감지: on/off 아무거나 오면 (n/3) 증가, 최대 3개 까지 증가"""
-        n = self.state.increment_counter('fire_count')
-        if n > 4:
-            n = 4
-            self.state.counters['fire_count'] = 4
-        
-        # 감지 버튼(빨간→노랑) & 텍스트 갱신
+    def _on_fire_on(self):
+        # 총합이 4 미만일 때만 증가 (중복 방지)
+        if self._fire_on + self._fire_off < 4:
+            self._fire_on += 1
+        self._after_fire_update()
+
+    @QtCore.Slot()
+    def _on_fire_off(self):
+        if self._fire_on + self._fire_off < 4:
+            self._fire_off += 1
+        self._after_fire_update()
+
+    def _after_fire_update(self):
+        total = self._fire_on + self._fire_off
+
+        # 감지 시작 시 버튼을 활성(노랑)으로
         if not self.state.get_flag('fire_flag'):
             self.state.set_flag('fire_flag', True)
             self.btn_m3_fire.setStyleSheet(UI_STYLES.DET_ACTIVE)
-        self.btn_m3_fire.setText(f"FIRE: ({n}/4)")
-        self._append_log(f"[ROS2] 불 인식중... -> {n}/4")
 
-        # 3/3 도달 시 로봇 Fire 박스 초록
-        if n >= 4 and not self.state.get_flag('robot_fire_done_flag'):
+        # 버튼 텍스트는 on+off 합산으로 표시
+        self.btn_m3_fire.setText(f"FIRE: ({total}/4)")
+
+        # 터미널 로그: 켜진/꺼진 각각 출력
+        self._append_log(f"[ROS2] on: {self._fire_on}      off:{self._fire_off}")
+
+        # 완료 처리
+        if total >= 4 and not self.state.get_flag('robot_fire_done_flag'):
             self.state.set_flag('robot_fire_done_flag', True)
             if hasattr(self, 'btn_m3_fire_done'):
                 self.btn_m3_fire_done.setStyleSheet(UI_STYLES.ROBOT_ACTIVE)
             self._append_log("[ROS2] 불 인식 완료!(4/4)-> Robot Fire Done!")
-    
+
     @QtCore.Slot()
     def _on_door_detected(self):
         """문 감지"""
@@ -532,22 +527,34 @@ class MainWindow(QtWidgets.QMainWindow):
             self._append_log("[ROS2] 보급박스 2차 인식 완료! Safebox_2 detected!")
     
     @QtCore.Slot()
-    def _on_human_tick_m4(self):
-        # red/blue 아무거나 오면 +1, 최대 3
-        n = self.state.increment_counter('human_count')
-        if n > 3:
-            n = 3
-            self.state.counters['human_count'] = 3
+    def _on_human_red(self):
+        # 총합 3 미만일 때만 증가
+        if self._human_red + self._human_blue < 3:
+            self._human_red += 1
+        self._after_human_update()
 
-        # 감지 버튼 노랑 + 텍스트 (n/3)
+    @QtCore.Slot()
+    def _on_human_blue(self):
+        if self._human_red + self._human_blue < 3:
+            self._human_blue += 1
+        self._after_human_update()
+
+    def _after_human_update(self):
+        total = self._human_red + self._human_blue
+
+        # 최초 감지 시 버튼 활성(노랑)
         if not self.state.get_flag('human_flag'):
             self.state.set_flag('human_flag', True)
             self.btn_m4_human.setStyleSheet(UI_STYLES.DET_ACTIVE)
-        self.btn_m4_human.setText(f"HUMAN: ({n}/3)")
-        self._append_log(f"[ROS2] 사람 인식중... -> {n}/3")
 
-        # 3/3 도달 → HumanEnd 초록
-        if n >= 3 and not self.state.get_flag('robot_human_done_flag'):
+        # 버튼 텍스트는 red+blue 합산으로
+        self.btn_m4_human.setText(f"HUMAN: ({total}/3)")
+
+        # 터미널 로그: 빨강/파랑 각각 출력
+        self._append_log(f"[ROS2] 사망: {self._human_red}      생존: {self._human_blue}")
+
+        # 완료 처리(3/3 도달)
+        if total >= 3 and not self.state.get_flag('robot_human_done_flag'):
             self.state.set_flag('robot_human_done_flag', True)
             if hasattr(self, 'btn_m4_human_end'):
                 self.btn_m4_human_end.setStyleSheet(UI_STYLES.ROBOT_ACTIVE)
@@ -675,12 +682,16 @@ class MainWindow(QtWidgets.QMainWindow):
             # 탐지 시그널 연결
             self.ros_thread.sos_detected.connect(self._on_sos_detected)
             self.ros_thread.button_detected.connect(self._on_button_detected)
-            self.ros_thread.fire_detected.connect(self._on_fire_detected)
+            self.ros_thread.fire_on_detected.connect(self._on_fire_on)
+            self.ros_thread.fire_off_detected.connect(self._on_fire_off)
             self.ros_thread.door_detected.connect(self._on_door_detected)
             self.ros_thread.safebox_detected.connect(self._on_safebox_detected)
             self.ros_thread.safebox2_detected.connect(self._on_safebox2_detected)
-            self.ros_thread.human_tick.connect(self._on_human_tick_m4)
+            self.ros_thread.human_red_detected.connect(self._on_human_red)
+            self.ros_thread.human_blue_detected.connect(self._on_human_blue)
             self.ros_thread.finish_detected.connect(self._on_finish_detected)
+            # self.ros_thread.fire_on.connect(self._on_fire_on)
+            # self.ros_thread.fire_off.connect(self._on_fire_off)
             
             # 로봇 상태 시그널 연결
             self.ros_thread.robot_ok.connect(self._on_robot_ok)

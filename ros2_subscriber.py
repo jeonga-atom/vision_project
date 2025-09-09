@@ -8,13 +8,14 @@ class Ros2SubscriberThread(BaseSubscriberThread):
     # 탐지 시그널들
     sos_detected        = QtCore.Signal()
     button_detected     = QtCore.Signal()
-    fire_detected       = QtCore.Signal()
+    fire_on_detected    = QtCore.Signal()
+    fire_off_detected   = QtCore.Signal()
     door_detected       = QtCore.Signal()
     safebox_detected    = QtCore.Signal()
     safebox2_detected   = QtCore.Signal()
-    human_tick          = QtCore.Signal()
+    human_red_detected  = QtCore.Signal()
+    human_blue_detected = QtCore.Signal()
     finish_detected     = QtCore.Signal()
-    
     # 로봇 상태 시그널들
     robot_ok            = QtCore.Signal()
     robot_open          = QtCore.Signal()
@@ -22,6 +23,8 @@ class Ros2SubscriberThread(BaseSubscriberThread):
     robot_button_end    = QtCore.Signal()
     robot_open_door_end = QtCore.Signal()
     pick_place_end      = QtCore.Signal()
+    # fire_on             = QtCore.Signal()
+    # fire_off            = QtCore.Signal()
 
     
     def __init__(self, parent=None):
@@ -38,14 +41,14 @@ class Ros2SubscriberThread(BaseSubscriberThread):
             '/object_detection/SOS': self.sos_detected,
             # mission 3
             '/object_detection/button': self.button_detected,
-            '/object_detection/fire/on': self.fire_detected,
-            '/object_detection/fire/off': self.fire_detected,
+            '/object_detection/fire/on': self.fire_on_detected,
+            '/object_detection/fire/off': self.fire_off_detected,
             '/object_detection/door': self.door_detected,
             #mission 4
             '/object_detection/safebox': self.safebox_detected,
             '/object_detection/safebox_2': self.safebox2_detected,
-            '/object_detection/human/red': self.human_tick,
-            '/object_detection/human/blue': self.human_tick,
+            '/object_detection/human/red': self.human_red_detected,
+            '/object_detection/human/blue': self.human_blue_detected,
             '/object_detection/finish': self.finish_detected,
         }
         # ----------- 로봇 상태 토픽들 -----------------
